@@ -1,9 +1,8 @@
 """Telegram Business assistant for non-official gift proposals.
-FINAL: PEER_FLOOD fix — link preview DISABLED everywhere (it triggers
-PEER_FLOOD when Telegram fetches the link), but the gift LINK itself
-stays in the text (clickable, no manual copying needed).
-Offer is created by EDITING the buyer's command (no new message to
-strangers => no PEER_FLOOD). Fallback: separate message (original logic).
+FINAL FIX: Two-step edit to avoid PEER_FLOOD.
+1. First edit: Text WITH link, but Link Preview DISABLED (safe from flood).
+2. Second edit (after 0.5s delay): Link Preview ENABLED (restores image/card).
+Emoji removed from proposal text. Delay reduced to 0.5s for smooth look.
 """
 
 import asyncio
@@ -126,8 +125,7 @@ async def safe_send_then_delete(
     bot: Bot, text: str, chat_id: int, command_message_id: int,
     business_connection_id: str, reply_markup: InlineKeyboardMarkup,
 ) -> Message:
-    """ЗАПАСНОЙ ПУТЬ: отправка оффера отдельным сообщением + удаление команды.
-    Превью отключено (иначе PEER_FLOOD). На ошибку — ретраи."""
+    """ЗАПАСНОЙ ПУТЬ: отправка оффера отдельным сообщением + удаление команды."""
     await send_cooldown()
     preview = LinkPreviewOptions(is_disabled=True)
 
@@ -157,7 +155,7 @@ async def safe_send_then_delete(
     if sent_msg is None:
         raise last_error or RuntimeError("Не удалось отправить оффер")
 
-    # Оффер доставлен — теперь безопасно удалять команду.
+    # Удаление команды
     for attempt in range(2):
         try:
             await bot.delete_business_messages(
@@ -166,7 +164,7 @@ async def safe_send_then_delete(
             )
             break
         except Exception:
-            break  # не критично
+            break
 
     return sent_msg
 
@@ -199,8 +197,7 @@ def remaining(offer: Offer) -> str:
     return f"{hours}ч {minutes:02d}м"
 
 def proposal_text(offer: Offer) -> str:
-    # УБРАН эмодзи подарка, осталась только кликабельная ссылка с названием.
-    # Превью отключено (иначе PEER_FLOOD).
+    # Эмодзи удалено. Ссылка кликабельна.
     return (
         f"Пользователь <b>{html.escape(offer.buyer_name)}</b> предлагает Вам\n"
         f"<b>{offer.price} {offer.currency}</b> за подарок\n"
@@ -224,6 +221,31 @@ def proposal_keyboard(offer_id: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="✕ Отклонить", callback_data=f"decline:{offer_id}"),
         InlineKeyboardButton(text="✓ Принять", callback_data=f"accept:{offer_id}"),
     ]])
+
+
+async def enable_offer_preview_later(offer: Offer, bot: Bot):
+    """
+    Шаг 2 (через 0.5 сек): Включаем превью, чтобы появилась картинка/описание ссылки.
+    Если PEER_FLOOD — оставляем как есть (кнопка и ссылка работают).
+    """
+    # Уменьшили задержку до 0.5 сек, чтобы переход был почти незаметен
+    await asyncio.sleep(0.5)
+    if offer.status == "active":
+        try:
+            await bot.edit_message_text(
+                text=proposal_text(offer),
+                chat_id=offer.chat_id,
+                message_id=offer.message_id,
+                business_connection_id=offer.connection_id,
+                reply_markup=proposal_keyboard(offer.id),
+                link_preview_options=LinkPreviewOptions(is_disabled=False)
+            )
+            logging.info(f"Оффер {offer.id}: превью успешно включено.")
+        except Exception as e:
+            if is_peer_flood(e):
+                logging.warning(f"Оффер {offer.id}: не удалось включить превью (PEER_FLOOD). Оставляем без картинки, ссылка активна.")
+            else:
+                logging.warning(f"Оффер {offer.id}: ошибка при включении превью: {e}")
 
 
 @router.business_message(F.text)
@@ -255,9 +277,9 @@ async def create_offer(message: Message, bot: Bot) -> None:
         keyboard = proposal_keyboard(temporary.id)
         text = proposal_text(temporary)
 
-        #============ ОСНОВНОЙ ПУТЬ: РЕДАКТИРОВАНИЕ КОМАНДЫ ============
-        # Превращаем команду в оффер. Превью откл. (PEER_FLOOD),
-        # ссылка в тексте кликабельна. Новый адресат не создаётся — флуда нет.
+        #============ ШАГ 1 (БЕЗОПАСНЫЙ): РЕДАКТИРОВАНИЕ БЕЗ ПРЕВЬЮ ============
+        # Ссылка в тексте ЕСТЬ (синяя кликабельная), но картинка-превью выключена.
+        # Это спасает от PEER_FLOOD при первой отправке.
         edit_ok = False
         try:
             await bot.edit_message_text(
@@ -266,23 +288,19 @@ async def create_offer(message: Message, bot: Bot) -> None:
                 message_id=message.message_id,
                 business_connection_id=message.business_connection_id,
                 reply_markup=keyboard,
-                link_preview_options=LinkPreviewOptions(is_disabled=True)
+                link_preview_options=LinkPreviewOptions(is_disabled=True)  # Выключено сейчас
             )
             edit_ok = True
-            logging.info(
-                f"Оффер {temporary.id} создан через редактирование команды "
-                f"(chat_id={message.chat.id}) — ссылка кликабельна, превью отключено."
-            )
+            logging.info(f"Оффер {temporary.id}: создан (Шаг 1: без превью).")
         except Exception as edit_error:
-            logging.warning(
-                f"Не удалось оформить оффер редактированием (chat_id={message.chat.id}): "
-                f"{edit_error!r}. Переходим на отправку отдельным сообщением."
-            )
+            logging.warning(f"Не удалось оформить оффер редактированием (chat_id={message.chat.id}): {edit_error!r}")
 
         if edit_ok:
             temporary.message_id = message.message_id
+            # Запускаем Шаг 2 асинхронно (не блокируя бота)
+            asyncio.create_task(enable_offer_preview_later(temporary, bot))
         else:
-            #============ ЗАПАСНОЙ ПУТЬ ============
+            # Если Шаг 1 не сработал — запасной путь с отправкой сообщения
             sent_msg = await safe_send_then_delete(
                 bot=bot,
                 text=text,
@@ -364,12 +382,13 @@ async def refresh_loop(bot: Bot) -> None:
             new_text = proposal_text(offer)
             if new_text != offer.last_sent_text:
                 try:
+                    # Refresh loop также пытается держать превью включённым
                     await safe_edit_message_text(
                         bot, text=new_text,
                         chat_id=offer.chat_id, message_id=offer.message_id,
                         business_connection_id=offer.connection_id,
                         reply_markup=proposal_keyboard(offer.id),
-                        link_preview_options=LinkPreviewOptions(is_disabled=True)
+                        link_preview_options=LinkPreviewOptions(is_disabled=False)
                     )
                     offer.last_sent_text = new_text
                 except Exception:
