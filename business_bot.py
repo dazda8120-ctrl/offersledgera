@@ -1,7 +1,9 @@
 """Telegram Business assistant for non-official gift proposals.
-Команда: 'купить ссылка цена' -> Мгновенный оффер с красивой ссылкой.
-         'купить цена' -> Ожидание (можно позже отправить 'купить ссылка').
-Таймер в тексте статичный, фоновых правок нет.
+Исправленная версия:
+- Исправлен import time
+- Исправлен класс Offer (добавлено ttl_str)
+- Команда работает как /купить, так и купить
+- Подробные логи для отладки
 """
 
 import asyncio
@@ -10,7 +12,7 @@ import logging
 import os
 import re
 import secrets
-import time  # <-- Вернут импорт time
+import time  # <--- ИСПРАВЛЕНО: импортируем time
 from datetime import UTC, datetime, timedelta
 from dataclasses import dataclass
 
@@ -23,7 +25,7 @@ from aiogram.types import (
     LinkPreviewOptions,
     Message,
 )
-# Попытка импортировать Flood ошибку
+# Хелперы ошибок
 try:
     from aiogram.exceptions import TelegramRetryAfter
 except ImportError:
@@ -42,10 +44,12 @@ TOKEN = os.getenv("BOT_TOKEN", "")
 TTL_HOURS = int(os.getenv("OFFER_TTL_HOURS", "5"))
 
 router = Router()
-COMMAND_REGEX = re.compile(r"^купить\s+(.*)$", re.IGNORECASE)
+# Команда: купить (с / или без) + всё остальное
+COMMAND_REGEX = re.compile(r"^/купить\s+(.+)|^купить\s+(.+)", re.IGNORECASE)
+
 GIFT_EMOJI_HTML = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
 
-# Кулдаун и лок
+# Кулдаун отправки (чтобы не спамить API)
 SEND_COOLDOWN_SECONDS = 2.0
 _last_send_time: float = 0.0
 _send_lock = asyncio.Lock()
@@ -78,7 +82,8 @@ class Offer:
     price: str
     currency: str
     expires_at: datetime
-    status: str  # "active" or "pending"
+    status: str
+    ttl_str: str  # <--- ИСПРАВЛЕНО: добавлено поле
 
 
 # Хранилища
@@ -94,8 +99,7 @@ async def safe_edit_message_text(
 ) -> None:
     if link_preview_options is None:
         link_preview_options = LinkPreviewOptions(is_disabled=True)
-    max_retries = 3
-    for attempt in range(max_retries):
+    for attempt in range(3):
         try:
             await bot.edit_message_text(
                 text=text, chat_id=chat_id, message_id=message_id,
@@ -104,13 +108,12 @@ async def safe_edit_message_text(
             )
             return
         except TelegramRetryAfter as e:
-            wait_time = e.retry_after if hasattr(e, 'retry_after') else 60
-            if attempt == max_retries - 1: raise e
-            logging.info(f"Edit Flood Wait ({wait_time}s).")
-            await asyncio.sleep(wait_time)
+            wait = e.retry_after if hasattr(e, 'retry_after') else 60
+            logging.info(f"EDIT FLOOD WAIT {wait}s")
+            await asyncio.sleep(wait)
         except Exception as e:
-            logging.debug(f"Edit failed: {e}")
-            if attempt == max_retries - 1: raise e
+            logging.warning(f"Edit error attempt {attempt}: {e}")
+            if attempt == 2: raise e
             await asyncio.sleep(1)
 
 
@@ -121,9 +124,7 @@ async def safe_send_message_text(
     link_preview_options: LinkPreviewOptions
 ) -> Message:
     await send_cooldown()
-    last_error: Exception = None
-    MAX_RETRIES = 6
-    for attempt in range(MAX_RETRIES):
+    for attempt in range(6):
         try:
             return await bot.send_message(
                 chat_id=chat_id, text=text,
@@ -131,35 +132,40 @@ async def safe_send_message_text(
                 reply_markup=reply_markup, link_preview_options=link_preview_options
             )
         except TelegramRetryAfter as e:
-            wait_time = e.retry_after if hasattr(e, 'retry_after') else 30
-            logging.info(f"Send Flood Wait ({wait_time}s).")
-            await asyncio.sleep(wait_time)
+            wait = e.retry_after if hasattr(e, 'retry_after') else 30
+            logging.info(f"SEND FLOOD WAIT {wait}s")
+            await asyncio.sleep(wait)
         except Exception as e:
-            last_error = e
             if is_peer_flood(e):
                 wait = 60 * (attempt + 1)
-                logging.error(f"PEER_FLOOD retry {attempt+1}/{MAX_RETRIES} wait {wait}s")
+                logging.error(f"PEER_FLOOD retry {attempt+1}, wait {wait}s")
                 await asyncio.sleep(wait)
                 continue
-            raise
-    if last_error: raise last_error
+            raise e
+    raise Exception("Too many retries")
 
 
 def gift_slug_from_link(link: str) -> str:
-    match = re.search(r"/nft/([^/?#]+)", link)
+    if not link: return ""
+    # Гибкий поиск: /NFT/ или /nft/
+    match = re.search(r"/nft/([^/?#]+)", link, re.IGNORECASE)
     return match.group(1) if match else ""
 
 def gift_title_from_slug(slug: str) -> str:
+    if not slug: return "NFT"
+    # Формат: Имя-Номер -> Имя #Номер
     name, _, num = slug.rpartition("-")
     if name and num.isdigit():
-        return f"{name} #{int(num):,}"
-    return slug or "NFT"
+        num_int = int(num)
+        if num_int >= 1000:
+            num_str = f"{num_int:,}"
+        else:
+            num_str = str(num_int)
+        return f"{name} #{num_str}"
+    return slug
 
 def parse_command_payload(payload: str) -> tuple[str | None, str | None, str]:
-    """
-    Разбор команды: (ссылка, цена, валюта)
-    Работает и с 'купить цена ссылка', и с 'купить ссылка цена'.
-    """
+    """Возвращает (ссылка, цена, валюта)"""
     parts = payload.split()
     if not parts: return None, None, "Stars"
     
@@ -169,49 +175,47 @@ def parse_command_payload(payload: str) -> tuple[str | None, str | None, str]:
 
     # 1. Ищем ссылку
     for part in parts:
-        if "t.me/nft" in part and link is None:
+        if "t.me/nft" in part.lower() and link is None:
             link = part
-    
+            
     # 2. Ищем цену (число)
     for part in parts:
         if part == link: continue
         try:
             raw = part.replace(",", ".").lower()
             if raw.replace(".", "").isdigit():
-                price_val = float(raw)
-                if 0 < price_val < 10000000:
-                    price = price_val
+                val = float(raw)
+                if 0 < val < 10_000_000:
+                    price = val
                     if "gram" in payload.lower(): currency = "TON"
                     break
         except ValueError: pass
 
-    # Форматирование цены
-    if price: 
-        price = f"{int(price) if int(price) == price else price:f}".rstrip('0').rstrip('.')
-        
+    if price: price = f"{int(price) if int(price) == price else price:f}".rstrip('0').rstrip('.')
     return link, price, currency
 
 
-def pending_text(offer: Offer) -> str:
-    return (
-        f"Пользователь <b>{html.escape(offer.buyer_name)}</b> предлагает Вам\n"
-        f"<b>{offer.price} {offer.currency}</b> за подарок\n"
-        f"<i>(Ожидание ссылки...)</i>\n\n"
-        f'<b>Напишите: купить ССЫЛКА</b>'
-    )
-
 def final_text(offer: Offer) -> str:
-    # Если ссылка есть — кликабельный красивый текст
+    title = offer.gift_title if offer.gift_title else "NFT"
     if offer.link:
-        title = offer.gift_title
+        # Красивая ссылка
         link_html = f'<b><a href="{offer.link}">{html.escape(title)}</a></b>'
     else:
-        link_html = 'NFT'
+        # Просто текст
+        link_html = f'<b>{title}</b>'
         
     return (
         f"Пользователь <b>{html.escape(offer.buyer_name)}</b> предлагает Вам\n"
         f"<b>{offer.price} {offer.currency}</b> за подарок {link_html}.\n\n"
         f"<b>Предложение действует ещё {offer.ttl_str}ч 59м.</b>"
+    )
+
+def pending_text(offer: Offer) -> str:
+    return (
+        f"Пользователь <b>{html.escape(offer.buyer_name)}</b> предлагает Вам\n"
+        f"<b>{offer.price} {offer.currency}</b> за подарок\n"
+        f"<i>Ожидание ссылки на NFT...</i>\n\n"
+        f'<b>Напишите: купить ССЫЛКА</b>'
     )
 
 def sold_text(offer: Offer) -> str:
@@ -220,36 +224,68 @@ def sold_text(offer: Offer) -> str:
         f"• Передайте подарок покупателю для зачисления {offer.currency}."
     )
 
-def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Передать", url=f"tg://user?id={offer.buyer_id}")],
-    ])
-
 def proposal_keyboard(offer_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✕ Отклонить", callback_data=f"decline:{offer_id}"),
         InlineKeyboardButton(text="✓ Принять", callback_data=f"accept:{offer_id}"),
     ]])
 
+def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Передать", url=f"tg://user?id={offer.buyer_id}")],
+    ])
+
+
+async def delete_command(message: Message, bot: Bot, conn_id: str):
+    try:
+        await bot.delete_business_messages(conn_id, message_ids=[message.message_id])
+    except:
+        pass
+
 
 @router.business_message(F.text)
 async def create_offer(message: Message, bot: Bot) -> None:
-    if not message.text or not message.business_connection_id:
+    if not message.text:
+        return
+        
+    logging.info(f"COMMAND RECEIVED: {message.text[:50]}...")
+
+    # Проверка Битнес-соединения
+    conn_id = message.business_connection_id
+    if not conn_id:
+        logging.warning("No Business Connection ID found.")
+        await message.answer("Это не бизнес-чат.", quote=False)
         return
 
     match = COMMAND_REGEX.fullmatch(message.text.strip())
-    if not match: return
-    payload = match.group(1)
+    if not match: 
+        # Пробуем найти цену, если команда не полностью совпала (для удобства)
+        payload = message.text.strip()
+        if not payload.startswith("купить") and not payload.startswith("/купить"):
+             return
+        
+        # Вырезаем если есть /
+        if payload.startswith("/"):
+             payload = payload[1:]
+             
+        # Снова пробуем
+        parts = payload.split()
+        if not parts: return
+     
+    # Парсим
+    # Получаем группу 1 или 2 из регулярки
+    payload = match.group(1) or match.group(2)
     
     link, price, currency = parse_command_payload(payload)
+    
+    logging.info(f"Parsed: Link={bool(link)}, Price={price}, Currency={currency}")
 
-    # Валидация: должно быть хоть что-то
     if not link and not price:
-        await message.answer("Укажите цену или ссылку!", quote=False)
+        await message.answer("Непонятная команда. Пример: купить 100", quote=False)
         return
 
     try:
-        connection = await bot.get_business_connection(message.business_connection_id)
+        connection = await bot.get_business_connection(conn_id)
         buyer = connection.user
         buyer_id = buyer.id
         buyer_name = (
@@ -257,142 +293,137 @@ async def create_offer(message: Message, bot: Bot) -> None:
             else (buyer.full_name if hasattr(buyer, "full_name") else f"id{buyer.id}")
         )
 
-        # --- Логика обработки ---
-        
-        # 1. Есть и ссылка, и цена -> Мгновенный оффер
+        # Сценарий 1: Есть и цена, и ссылка -> Отправляем сразу
         if link and price:
             offer_id = secrets.token_urlsafe(8)
             slug = gift_slug_from_link(link)
+            title = gift_title_from_slug(slug)
             
             offer = Offer(
-                id=offer_id, connection_id=message.business_connection_id,
+                id=offer_id, connection_id=conn_id,
                 chat_id=message.chat.id, message_id=message.message_id,
                 buyer_id=buyer_id, buyer_name=buyer_name,
-                link=link, gift_title=gift_title_from_slug(slug),
+                link=link, gift_title=title,
                 price=price, currency=currency,
                 expires_at=datetime.now(UTC) + timedelta(hours=TTL_HOURS),
-                status="active", ttl_str=str(TTL_HOURS) # Статичное время для текста
+                status="active", ttl_str=str(TTL_HOURS)
             )
             
-            await delete_command(message, bot, message.business_connection_id)
-            await send_final(offer_id, bot, message.chat.id, message.business_connection_id, offer)
-            offers[offer_id] = offer
-            return
-
-        # 2. Есть только ссылка -> Обновляем pending оффер (если он есть)
-        elif link and not price:
-            pending = pending_by_connection.get(message.business_connection_id)
-            if pending:
-                pending.link = link
-                pending.gift_title = gift_title_from_slug(gift_slug_from_link(link))
-                pending.status = "active"
-                pending.expires_at = datetime.now(UTC) + timedelta(hours=TTL_HOURS)
-                
-                # Обновляем текст и клавиатуру
-                text = final_text(pending)
-                await safe_edit_message_text(bot, text, pending.chat_id, pending.message_id,
-                    pending.connection_id, proposal_keyboard(pending.id), LinkPreviewOptions(is_disabled=True))
-                
-                # Переносим в активные
-                offers[pending.id] = pending
-                del pending_by_connection[message.business_connection_id]
-                
-                await delete_command(message, bot, message.business_connection_id)
-                return
-            # Если pending нет, можно проигнорировать или создать (по логике выше лучше создать pending с ценой, но тут только ссылка)
-            # Для простоты игнорируем если только ссылка без pending
-            await message.answer("Ссылка не привязана ни к одному предложению.", quote=False)
-            return
-
-        # 3. Есть только цена -> Создаем Pending
+            await delete_command(message, bot, conn_id)
+            
+            text = final_text(offer)
+            keyboard = proposal_keyboard(offer_id)
+            
+            try:
+                await safe_send_message_text(
+                    bot, text, message.chat.id, conn_id, keyboard, LinkPreviewOptions(is_disabled=True)
+                )
+                offers[offer_id] = offer
+                logging.info(f"Active offer created: {price} {currency}")
+            except:
+                await message.answer("Ошибка при отправке (возможно PEER_FLOOD).", quote=False)
+            
+        # Сценарий 2: Только цена -> Ожидаем ссылку
         elif price and not link:
             offer_id = secrets.token_urlsafe(8)
             offer = Offer(
-                id=offer_id, connection_id=message.business_connection_id,
+                id=offer_id, connection_id=conn_id,
                 chat_id=message.chat.id, message_id=message.message_id,
                 buyer_id=buyer_id, buyer_name=buyer_name,
-                link="", gift_title="", price=price, currency=currency,
+                link="", gift_title="",
+                price=price, currency=currency,
                 expires_at=datetime.now(UTC) + timedelta(hours=TTL_HOURS),
                 status="pending", ttl_str=str(TTL_HOURS)
             )
-
+            
+            await delete_command(message, bot, conn_id)
+            
             text = pending_text(offer)
             keyboard = proposal_keyboard(offer_id)
             
-            await delete_command(message, bot, message.business_connection_id)
-            
-            msg = await safe_send_message_text(
-                bot, text, message.chat.id, message.business_connection_id, keyboard,
-                LinkPreviewOptions(is_disabled=True)
-            )
-            offer.message_id = msg.message_id
-            
-            offers[offer_id] = offer
-            pending_by_connection[message.business_connection_id] = offer
-            return
+            try:
+                msg = await safe_send_message_text(
+                    bot, text, message.chat.id, conn_id, keyboard, LinkPreviewOptions(is_disabled=True)
+                )
+                offer.message_id = msg.message_id
+                offers[offer_id] = offer
+                pending_by_connection[conn_id] = offer
+                logging.info(f"Pending offer created for {conn_id}")
+            except:
+                await message.answer("Ошибка при создании ожидания.", quote=False)
+                
+        # Сценарий 3: Только ссылка (завершаем pending)
+        elif link and not price:
+            if conn_id in pending_by_connection:
+                pending = pending_by_connection[conn_id]
+                pending.link = link
+                pending.gift_title = gift_title_from_slug(gift_slug_from_link(link))
+                pending.status = "active"
+                
+                text = final_text(pending)
+                keyboard = proposal_keyboard(pending.id)
+                
+                await safe_edit_message_text(bot, text, pending.chat_id, pending.message_id, conn_id, keyboard, LinkPreviewOptions(is_disabled=True))
+                
+                del pending_by_connection[conn_id]
+                logging.info(f"Pending offer {pending.id} completed.")
+                await delete_command(message, bot, conn_id)
+            else:
+                await message.answer("Ссылка отправлена, но нет активного ожидания!", quote=False)
 
     except Exception as e:
         if is_peer_flood(e):
-            logging.error(f"PeerFlood: {e!r}")
+            logging.error(f"FLOOD ERROR: {e}")
+            await message.answer("Временная задержка отправки (Flood).", quote=False)
         else:
-            logging.exception(f"Error: {e}")
-
-
-async def send_final(offer_id: str, bot: Bot, chat_id: int, conn_id: str, offer: Offer):
-    text = final_text(offer)
-    keyboard = proposal_keyboard(offer_id)
-    try:
-        await safe_send_message_text(
-            bot, text, chat_id, conn_id, keyboard, LinkPreviewOptions(is_disabled=True)
-        )
-    except Exception as e:
-        logging.error(f"Failed to send final: {e}")
-        # Если упало, очищаем, чтобы не висел невалидный оффер
-        if offer_id in offers: offers.pop(offer_id)
-
-async def delete_command(message: Message, bot: Bot, conn_id: str):
-    try:
-        await bot.delete_business_messages(conn_id, message_ids=[message.message_id])
-    except: pass
+            logging.exception(f"Unexpected error: {e}")
+            await message.answer("Внутренняя ошибка бота.", quote=False)
 
 
 @router.callback_query(F.data.startswith(("accept:", "decline:")))
 async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
     action, offer_id = callback.data.split(":", 1)
     offer = offers.get(offer_id)
+    
     if not offer: 
-        await callback.answer("Оффер не найден.")
+        await callback.answer("Оффер не найден.", show_alert=True)
         return
-
-    # Удаляем из pending если там был
-    con_id = offer.connection_id
-    if con_id in pending_by_connection and pending_by_connection[con_id].id == offer_id:
-        del pending_by_connection[con_id]
+    
+    # Удаляем из pending-списка если там был
+    if offer.status == "pending" and offer.connection_id in pending_by_connection:
+        if pending_by_connection[offer.connection_id].id == offer_id:
+             del pending_by_connection[offer.connection_id]
 
     if action == "decline":
+        offers.pop(offer_id, None)
         await safe_edit_message_text(bot, "❌ Предложение отклонено", offer.chat_id, offer.message_id, offer.connection_id, None)
-        offers.pop(offer_id)
         await callback.answer("Отклонено.")
     else:
+        # Принятие
         text = sold_text(offer)
         await safe_edit_message_text(
             bot, text, offer.chat_id, offer.message_id,
             offer.connection_id, sold_keyboard(offer)
         )
-        offers.pop(offer_id)
+        offers.pop(offer_id, None)
         await callback.answer("Принято.")
 
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
+    if not TOKEN:
+        logging.error("BOT_TOKEN is missing!")
+        return
+        
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"), timeout=15)
     dp = Dispatcher()
     dp.include_router(router)
+    
     try:
+        logging.info("Starting bot...")
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
