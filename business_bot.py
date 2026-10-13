@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import secrets
+import time
 from dataclasses import dataclass
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -79,6 +80,37 @@ class Offer:
 offers: dict[str, Offer] = {}
 
 
+async def safe_send_message_text(
+    bot: Bot, text: str, chat_id: int,
+    business_connection_id: str,
+    reply_markup: InlineKeyboardMarkup,
+    link_preview_options: LinkPreviewOptions
+) -> Message:
+    await send_cooldown()
+    last_error: Exception = None
+    MAX_PEER_FLOOD_RETRIES = 6
+    for attempt in range(MAX_PEER_FLOOD_RETRIES):
+        try:
+            return await bot.send_message(
+                chat_id=chat_id, text=text,
+                business_connection_id=business_connection_id,
+                reply_markup=reply_markup, link_preview_options=link_preview_options
+            )
+        except TelegramRetryAfter as e:
+            wait_time = e.retry_after if hasattr(e, 'retry_after') else 30
+            logging.info(f"Send Flood Wait ({wait_time}s).")
+            await asyncio.sleep(wait_time)
+        except Exception as e:
+            last_error = e
+            if is_peer_flood(e):
+                wait = 60 * (attempt + 1)  # 60с, 120с, 180с... всё больше
+                logging.error(f"PEER_FLOOD, ждём {wait}с (попытка {attempt+1}/{MAX_PEER_FLOOD_RETRIES})")
+                await asyncio.sleep(wait)
+                continue
+            raise
+    if last_error: raise last_error
+
+
 async def safe_edit_message_text(
     bot: Bot, text: str, chat_id: int, message_id: int,
     business_connection_id: str | None = None,
@@ -105,35 +137,6 @@ async def safe_edit_message_text(
             logging.debug(f"Edit failed: {e}")
             if attempt == max_retries - 1: raise e
             await asyncio.sleep(1)
-
-
-async def safe_send_message_text(
-    bot: Bot, text: str, chat_id: int,
-    business_connection_id: str,
-    reply_markup: InlineKeyboardMarkup,
-    link_preview_options: LinkPreviewOptions
-) -> Message:
-    await send_cooldown()
-    last_error: Exception = None
-    for attempt in range(3):
-        try:
-            return await bot.send_message(
-                chat_id=chat_id, text=text,
-                business_connection_id=business_connection_id,
-                reply_markup=reply_markup, link_preview_options=link_preview_options
-            )
-        except TelegramRetryAfter as e:
-            wait_time = e.retry_after if hasattr(e, 'retry_after') else 30
-            logging.info(f"Send Flood Wait ({wait_time}s).")
-            await asyncio.sleep(wait_time)
-        except Exception as e:
-            last_error = e
-            if is_peer_flood(e):
-                logging.error(f"Send PEER_FLOOD retry: {e}")
-                await asyncio.sleep(30)
-                continue
-            raise
-    if last_error: raise last_error
 
 
 def parse_price(payload: str) -> str | None:
