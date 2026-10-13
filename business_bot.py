@@ -1,5 +1,9 @@
 """Telegram Business assistant for non-official gift proposals.
-Logic: Edits the command message immediately to show the offer.
+FINAL: PEER_FLOOD fix — link preview DISABLED everywhere (it triggers
+PEER_FLOOD when Telegram fetches the link), but the gift LINK itself
+stays in the text (clickable, no manual copying needed).
+Offer is created by EDITING the buyer's command (no new message to
+strangers => no PEER_FLOOD). Fallback: separate message (original logic).
 """
 
 import asyncio
@@ -8,6 +12,7 @@ import logging
 import os
 import re
 import secrets
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -21,15 +26,48 @@ from aiogram.types import (
     LinkPreviewOptions,
     Message,
 )
+# Попытка импортировать Flood ошибку из разных версий
+try:
+    from aiogram.exceptions import TelegramRetryAfter
+except ImportError:
+    try:
+        from aiogram.exceptions import TelegramFloodWait as TelegramRetryAfter
+    except ImportError:
+        class TelegramRetryAfter(Exception):
+            def __init__(self, message): self.message = message
+            @property
+            def retry_after(self): return 60
+
 from dotenv import load_dotenv
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN", "")
-# Изменено: по умолчанию 5 часов (плюс 59 минут добавляются в таймере)
 TTL_HOURS = int(os.getenv("OFFER_TTL_HOURS", "5"))
+
 router = Router()
 COMMAND = re.compile(r"^купить\s+(https?://t\.me/nft/[^\s?#/]+)\s+(\S+)(?:\s+(.*))?$", re.IGNORECASE)
 GIFT_EMOJI_HTML = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
+
+# Кулдаун на отправку (запасной путь)
+SEND_COOLDOWN_SECONDS = 3.0
+_last_send_time: float = 0.0
+_send_lock = asyncio.Lock()
+
+
+def is_peer_flood(e: Exception) -> bool:
+    """Определяет PeerFlood в любом виде исключения."""
+    return "PEER_FLOOD" in str(e).upper()
+
+
+async def send_cooldown() -> None:
+    """Кулдаун между отправками новых сообщений."""
+    global _last_send_time
+    async with _send_lock:
+        now = time.monotonic()
+        elapsed = now - _last_send_time
+        if elapsed < SEND_COOLDOWN_SECONDS:
+            await asyncio.sleep(SEND_COOLDOWN_SECONDS - elapsed)
+        _last_send_time = time.monotonic()
 
 
 @dataclass
@@ -47,15 +85,95 @@ class Offer:
     currency: str
     expires_at: datetime
     status: str = "active"
+    last_sent_text: str = ""
 
 
 offers: dict[str, Offer] = {}
 
 
+async def safe_edit_message_text(
+    bot: Bot, text: str, chat_id: int, message_id: int,
+    business_connection_id: str | None = None,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    link_preview_options: LinkPreviewOptions | None = None
+) -> None:
+    """Редактирование с защитой от Flood."""
+    if link_preview_options is None:
+        link_preview_options = LinkPreviewOptions(is_disabled=True)
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            await bot.edit_message_text(
+                text=text, chat_id=chat_id, message_id=message_id,
+                business_connection_id=business_connection_id,
+                reply_markup=reply_markup, link_preview_options=link_preview_options
+            )
+            return
+        except TelegramRetryAfter as e:
+            wait_time = e.retry_after if hasattr(e, 'retry_after') else 60
+            if attempt == max_retries - 1:
+                logging.warning(f"Flood Limit Reached (Edit). Wait {wait_time}s.")
+                raise e
+            logging.info(f"Edit Flood Wait ({wait_time}s). Retrying...")
+            await asyncio.sleep(wait_time)
+        except Exception as e:
+            logging.debug(f"Edit failed: {e}")
+            if attempt == max_retries - 1: raise e
+            await asyncio.sleep(1)
+
+
+async def safe_send_then_delete(
+    bot: Bot, text: str, chat_id: int, command_message_id: int,
+    business_connection_id: str, reply_markup: InlineKeyboardMarkup,
+) -> Message:
+    """ЗАПАСНОЙ ПУТЬ: отправка оффера отдельным сообщением + удаление команды.
+    Превью отключено (иначе PEER_FLOOD). На ошибку — ретраи."""
+    await send_cooldown()
+    preview = LinkPreviewOptions(is_disabled=True)
+
+    last_error: Exception | None = None
+    sent_msg: Message | None = None
+
+    for attempt in range(3):
+        try:
+            sent_msg = await bot.send_message(
+                chat_id=chat_id, text=text,
+                business_connection_id=business_connection_id,
+                reply_markup=reply_markup, link_preview_options=preview
+            )
+            break
+        except TelegramRetryAfter as e:
+            wait_time = e.retry_after if hasattr(e, 'retry_after') else 30
+            logging.info(f"Send Flood Wait ({wait_time}s). Retrying...")
+            await asyncio.sleep(wait_time)
+        except Exception as e:
+            last_error = e
+            if is_peer_flood(e):
+                logging.error(f"PEER_FLOOD при отправке (попытка #{attempt + 1}) в чат {chat_id}: {e}")
+                await asyncio.sleep(30)
+                continue
+            raise
+
+    if sent_msg is None:
+        raise last_error or RuntimeError("Не удалось отправить оффер")
+
+    # Оффер доставлен — теперь безопасно удалять команду.
+    for attempt in range(2):
+        try:
+            await bot.delete_business_messages(
+                business_connection_id=business_connection_id,
+                message_ids=[command_message_id]
+            )
+            break
+        except Exception:
+            break  # не критично
+
+    return sent_msg
+
+
 def gift_slug_from_link(link: str) -> str:
     match = re.search(r"/nft/([^/?#]+)", link)
     return match.group(1) if match else ""
-
 
 def gift_title_from_slug(slug: str) -> str:
     name, _, num = slug.rpartition("-")
@@ -63,21 +181,16 @@ def gift_title_from_slug(slug: str) -> str:
         return f"{name} #{int(num):,}"
     return slug or "подарок"
 
-
 def parse_command(text: str) -> tuple[str, str, str] | None:
     match = COMMAND.fullmatch(text.strip())
-    if not match:
-        return None
+    if not match: return None
     link, raw_price, flags = match.groups()
     try:
         price = Decimal(raw_price.replace(",", "."))
-        if price <= 0:
-            return None
-    except InvalidOperation:
-        return None
+        if price <= 0: return None
+    except InvalidOperation: return None
     currency = "TON" if "gram" in set((flags or "").lower().split()) else "Stars"
     return link, format(price.normalize(), "f"), currency
-
 
 def remaining(offer: Offer) -> str:
     seconds = max(0, int((offer.expires_at - datetime.now(UTC)).total_seconds()))
@@ -85,16 +198,15 @@ def remaining(offer: Offer) -> str:
     minutes, _ = divmod(seconds, 60)
     return f"{hours}ч {minutes:02d}м"
 
-
 def proposal_text(offer: Offer) -> str:
-    # Ссылка в названии подарка теперь также выделена жирным, как и таймер
+    # УБРАН эмодзи подарка, осталась только кликабельная ссылка с названием.
+    # Превью отключено (иначе PEER_FLOOD).
     return (
         f"Пользователь <b>{html.escape(offer.buyer_name)}</b> предлагает Вам\n"
-        f"<b>{offer.price} {offer.currency}</b> за подарок "
+        f"<b>{offer.price} {offer.currency}</b> за подарок\n"
         f'<b><a href="{offer.link}">{html.escape(offer.gift_title)}</a></b>.\n\n'
         f'<b>Предложение действует ещё {remaining(offer)}.</b>'
     )
-
 
 def sold_text(offer: Offer) -> str:
     return (
@@ -102,12 +214,10 @@ def sold_text(offer: Offer) -> str:
         f"• Передайте подарок покупателю для зачисления {offer.currency}."
     )
 
-
 def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Передать", url=f"tg://user?id={offer.buyer_id}")],
     ])
-
 
 def proposal_keyboard(offer_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
@@ -116,19 +226,12 @@ def proposal_keyboard(offer_id: str) -> InlineKeyboardMarkup:
     ]])
 
 
-def proposal_preview_options() -> LinkPreviewOptions:
-    # show_above_text=True делает картинку сверху (карточка)
-    return LinkPreviewOptions(is_disabled=False, show_above_text=True)
-
-
 @router.business_message(F.text)
 async def create_offer(message: Message, bot: Bot) -> None:
-    """Редактирует сообщение с командой 'на месте', превращая его в оффер."""
     if not message.text or not message.business_connection_id:
         return
     parsed = parse_command(message.text)
-    if not parsed:
-        return
+    if not parsed: return None
     link, price, currency = parsed
     try:
         connection = await bot.get_business_connection(message.business_connection_id)
@@ -138,46 +241,76 @@ async def create_offer(message: Message, bot: Bot) -> None:
             f"@{buyer.username}" if getattr(buyer, "username", None)
             else (buyer.full_name if hasattr(buyer, "full_name") else f"id{buyer.id}")
         )
-        
+
         slug = gift_slug_from_link(link)
         temporary = Offer(
             id=secrets.token_urlsafe(8), connection_id=message.business_connection_id,
-            chat_id=message.chat.id, message_id=message.message_id, 
-            buyer_id=buyer_id,
-            buyer_name=buyer_name, link=link, slug=slug,
-            gift_title=gift_title_from_slug(slug),
-            price=price, currency=currency,
-            # Изменено: + 59 минут к указанным часам
-            expires_at=datetime.now(UTC) + timedelta(hours=TTL_HOURS, minutes=59), 
+            chat_id=message.chat.id, message_id=message.message_id,
+            buyer_id=buyer_id, buyer_name=buyer_name, link=link, slug=slug,
+            gift_title=gift_title_from_slug(slug), price=price, currency=currency,
+            expires_at=datetime.now(UTC) + timedelta(hours=TTL_HOURS, minutes=59),
+            last_sent_text=""
         )
-        
-        # Редактируем сообщение НА МЕСТЕ (без удаления и отправки)
-        await bot.edit_message_text(
-            business_connection_id=message.business_connection_id,
-            chat_id=message.chat.id,
-            message_id=message.message_id,
-            text=proposal_text(temporary),
-            reply_markup=proposal_keyboard(temporary.id),
-            link_preview_options=proposal_preview_options(),
-        )
+
+        keyboard = proposal_keyboard(temporary.id)
+        text = proposal_text(temporary)
+
+        #============ ОСНОВНОЙ ПУТЬ: РЕДАКТИРОВАНИЕ КОМАНДЫ ============
+        # Превращаем команду в оффер. Превью откл. (PEER_FLOOD),
+        # ссылка в тексте кликабельна. Новый адресат не создаётся — флуда нет.
+        edit_ok = False
+        try:
+            await bot.edit_message_text(
+                text=text,
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                business_connection_id=message.business_connection_id,
+                reply_markup=keyboard,
+                link_preview_options=LinkPreviewOptions(is_disabled=True)
+            )
+            edit_ok = True
+            logging.info(
+                f"Оффер {temporary.id} создан через редактирование команды "
+                f"(chat_id={message.chat.id}) — ссылка кликабельна, превью отключено."
+            )
+        except Exception as edit_error:
+            logging.warning(
+                f"Не удалось оформить оффер редактированием (chat_id={message.chat.id}): "
+                f"{edit_error!r}. Переходим на отправку отдельным сообщением."
+            )
+
+        if edit_ok:
+            temporary.message_id = message.message_id
+        else:
+            #============ ЗАПАСНОЙ ПУТЬ ============
+            sent_msg = await safe_send_then_delete(
+                bot=bot,
+                text=text,
+                chat_id=message.chat.id,
+                command_message_id=message.message_id,
+                business_connection_id=message.business_connection_id,
+                reply_markup=keyboard,
+            )
+            temporary.message_id = sent_msg.message_id
+
+        temporary.last_sent_text = proposal_text(temporary)
         offers[temporary.id] = temporary
 
     except Exception as e:
-        # Если ошибка (например, PEER_FLOOD), удаляем команду
-        error_text = str(e)
-        if "PEER_FLOOD" in error_text or "FLOOD_WAIT" in error_text:
-            logging.warning("PEER_FLOOD encountered, command removed.")
+        if is_peer_flood(e):
+            logging.error(f"PeerFlood для chat_id={message.chat.id}: {e!r}")
+            try:
+                await bot.edit_message_text(
+                    text="⚠️ Не удалось отправить предложение (ограничение Telegram). Попробуйте позже.",
+                    chat_id=message.chat.id, message_id=message.message_id,
+                    business_connection_id=message.business_connection_id,
+                    reply_markup=None,
+                    link_preview_options=LinkPreviewOptions(is_disabled=True)
+                )
+            except Exception:
+                pass
         else:
             logging.exception("Could not create business proposal: %s", e)
-
-        # Очищаем команду в любом случае при ошибке
-        try:
-            await bot.delete_business_messages(
-                business_connection_id=message.business_connection_id,
-                message_ids=[message.message_id],
-            )
-        except:
-            pass
 
 
 @router.callback_query(F.data.startswith(("accept:", "decline:")))
@@ -185,71 +318,68 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
     action, offer_id = callback.data.split(":", 1)
     offer = offers.get(offer_id)
     if not offer or offer.status != "active":
-        await callback.answer("Предложение уже закрыто или бот был перезапущен.", show_alert=True)
+        await callback.answer("Предложение уже закрыто.", show_alert=True)
         return
-    if datetime.now(UTC) >= offer.expires_at:
-        offer.status = "expired"
-        await callback.answer("Срок предложения истёк.", show_alert=True)
-        return
-    if action == "decline":
-        offer.status = "declined"
-        await bot.edit_message_text(
-            business_connection_id=offer.connection_id, chat_id=offer.chat_id,
-            message_id=offer.message_id,
-            text="❌ <b>Предложение отклонено</b>\nСредства не резервировались и никакая оплата не выполнялась.",
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
-        )
-        await callback.answer("Предложение отклонено.")
-        return
-    offer.status = "accepted"
-    await bot.edit_message_text(
-        business_connection_id=offer.connection_id, chat_id=offer.chat_id,
-        message_id=offer.message_id,
-        text=sold_text(offer),
-        reply_markup=sold_keyboard(offer),
-    )
-    await callback.answer("Оффер принят. Оплата не выполнялась.")
+
+    offer.status = "accepted" if action == "accept" else "declined"
+
+    try:
+        if action == "decline":
+            text = "❌ <b>Предложение отклонено</b>\nСредства не резервировались."
+            await safe_edit_message_text(
+                bot, text=text, chat_id=offer.chat_id, message_id=offer.message_id,
+                business_connection_id=offer.connection_id, reply_markup=None
+            )
+            await callback.answer("Предложение отклонено.")
+        else:
+            text = sold_text(offer)
+            await safe_edit_message_text(
+                bot, text=text, chat_id=offer.chat_id, message_id=offer.message_id,
+                business_connection_id=offer.connection_id, reply_markup=sold_keyboard(offer)
+            )
+            await callback.answer("Оффер принят.")
+    except Exception as e:
+        logging.exception(f"Resolve error: {e}")
 
 
 async def refresh_loop(bot: Bot) -> None:
-    """Live-update remaining time on active offers, then expire them."""
     while True:
-        await asyncio.sleep(30)
+        await asyncio.sleep(60)
         now = datetime.now(UTC)
         for offer in list(offers.values()):
             if offer.status != "active":
                 continue
+
             if now >= offer.expires_at:
                 offer.status = "expired"
                 try:
-                    await bot.edit_message_text(
-                        business_connection_id=offer.connection_id, chat_id=offer.chat_id,
-                        message_id=offer.message_id,
-                        text="⚠️ <b>Предложение истекло</b>\nСредства не резервировались и никакая оплата не выполнялась.",
-                        link_preview_options=LinkPreviewOptions(is_disabled=True),
+                    await safe_edit_message_text(
+                        bot, text="⚠️ <b>Предложение истекло</b>",
+                        chat_id=offer.chat_id, message_id=offer.message_id,
+                        business_connection_id=offer.connection_id,
                     )
-                except Exception:
-                    logging.exception("Could not expire proposal %s", offer.id)
+                except Exception: pass
                 continue
-            try:
-                await bot.edit_message_text(
-                    business_connection_id=offer.connection_id, chat_id=offer.chat_id,
-                    message_id=offer.message_id,
-                    text=proposal_text(offer),
-                    reply_markup=proposal_keyboard(offer.id),
-                    link_preview_options=proposal_preview_options(),
-                )
-            except Exception:
-                logging.debug("Could not refresh timer for %s", offer.id)
+
+            new_text = proposal_text(offer)
+            if new_text != offer.last_sent_text:
+                try:
+                    await safe_edit_message_text(
+                        bot, text=new_text,
+                        chat_id=offer.chat_id, message_id=offer.message_id,
+                        business_connection_id=offer.connection_id,
+                        reply_markup=proposal_keyboard(offer.id),
+                        link_preview_options=LinkPreviewOptions(is_disabled=True)
+                    )
+                    offer.last_sent_text = new_text
+                except Exception:
+                    logging.debug("Could not refresh timer for %s", offer.id)
 
 
 async def main() -> None:
-    if not TOKEN:
-        raise RuntimeError("Заполните BOT_TOKEN в .env")
-    if not 1 <= TTL_HOURS <= 72:
-        raise RuntimeError("OFFER_TTL_HOURS должен быть от 1 до 72.")
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+    if not TOKEN: raise RuntimeError("Заполните BOT_TOKEN в .env")
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
+    bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"), timeout=15)
     dp = Dispatcher()
     dp.include_router(router)
     task = asyncio.create_task(refresh_loop(bot))
