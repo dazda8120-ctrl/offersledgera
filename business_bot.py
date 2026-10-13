@@ -1,9 +1,8 @@
 """Telegram Business assistant for non-official gift proposals.
-FINAL FIX: Two-step edit if link triggers PEER_FLOOD.
-1. Try to edit with link immediately (Preview OFF).
-2. If PEER_FLOOD occurs because of the link: edit WITHOUT link first, 
-   then add link later (after 1s).
-Emoji removed.
+FIX PEER_FLOOD: 
+1. First edit: Message text with GIFT TITLE (no link). Safe from PEER_FLOOD.
+2. Second edit (+0.5s): Convert title to a clickable LINK (add href).
+Emoji removed. Automatic link insertion in two steps.
 """
 
 import asyncio
@@ -197,21 +196,21 @@ def remaining(offer: Offer) -> str:
     minutes, _ = divmod(seconds, 60)
     return f"{hours}ч {minutes:02d}м"
 
-def proposal_text(offer: Offer) -> str:
-    # Эмодзи удалено. Ссылка кликабельна.
-    return (
-        f"Пользователь <b>{html.escape(offer.buyer_name)}</b> предлагает Вам\n"
-        f"<b>{offer.price} {offer.currency}</b> за подарок\n"
-        f'<b><a href="{offer.link}">{html.escape(offer.gift_title)}</a></b>.\n\n'
-        f'<b>Предложение действует ещё {remaining(offer)}.</b>'
-    )
-
-def proposal_text_no_link(offer: Offer) -> str:
-    # Текст БЕЗ ссылки (только название). Используется если PEER_FLOOD на ссылку.
+# Тексты для Шага 1 (без ссылки, просто жирный текст)
+def proposal_text_initial(offer: Offer) -> str:
     return (
         f"Пользователь <b>{html.escape(offer.buyer_name)}</b> предлагает Вам\n"
         f"<b>{offer.price} {offer.currency}</b> за подарок\n"
         f"<b>{html.escape(offer.gift_title)}</b>.\n\n"
+        f'<b>Предложение действует ещё {remaining(offer)}.</b>'
+    )
+
+# Тексты для Шага 2 (с ссылкой)
+def proposal_text_with_link(offer: Offer) -> str:
+    return (
+        f"Пользователь <b>{html.escape(offer.buyer_name)}</b> предлагает Вам\n"
+        f"<b>{offer.price} {offer.currency}</b> за подарок\n"
+        f'<b><a href="{offer.link}">{html.escape(offer.gift_title)}</a></b>.\n\n'
         f'<b>Предложение действует ещё {remaining(offer)}.</b>'
     )
 
@@ -233,22 +232,23 @@ def proposal_keyboard(offer_id: str) -> InlineKeyboardMarkup:
     ]])
 
 
-async def add_link_later(offer: Offer, bot: Bot):
+async def add_link_to_offer(offer: Offer, bot: Bot):
     """
-    Добавляем ссылку в текст оффера через 1 секунду.
+    Шаг 2: Через 0.5 секунды добавляем ссылку в название.
+    Перемаркируем жирный текст {title} -> {<a href="...">{title}</a>}
     """
-    await asyncio.sleep(1)
+    await asyncio.sleep(0.5)
     if offer.status == "active":
         try:
             await bot.edit_message_text(
-                text=proposal_text(offer),
+                text=proposal_text_with_link(offer),
                 chat_id=offer.chat_id,
                 message_id=offer.message_id,
                 business_connection_id=offer.connection_id,
                 reply_markup=proposal_keyboard(offer.id),
-                link_preview_options=LinkPreviewOptions(is_disabled=True) # Ссылку добавляем, превью всё равно откл.
+                link_preview_options=LinkPreviewOptions(is_disabled=True)
             )
-            logging.info(f"Оффер {offer.id}: ссылка добавлена.")
+            logging.info(f"Оффер {offer.id}: ссылка добавлена в текст.")
         except Exception as e:
             logging.warning(f"Оффер {offer.id}: ошибка при добавлении ссылки: {e}")
 
@@ -280,55 +280,35 @@ async def create_offer(message: Message, bot: Bot) -> None:
         )
 
         keyboard = proposal_keyboard(temporary.id)
-        final_text_with_link = proposal_text(temporary)
-        text_without_link = proposal_text_no_link(temporary)
         
-        #============ РЕДАКТИРОВАНИЕ КОМАНДЫ ============
-        # 1. Сначала пробуем сразу с ссылкой (превью откл).
-        # 2. Если PEER_FLOOD (ссылка мешает), делаем сначала без ссылки, потом добавляем.
+        #============ ШАГ 1: РЕДАКТИРОВАНИЕ БЕЗ ССЫЛКИ ============
+        # Сразу отправляем без href'а. Ссылка появляется чуть позже.
+        # Это исключает PEER_FLOOD при первом редактировании.
         edit_ok = False
-        preview_disabled = LinkPreviewOptions(is_disabled=True)
-        
+        text_now = proposal_text_initial(temporary)
         try:
             await bot.edit_message_text(
-                text=final_text_with_link,
+                text=text_now,
                 chat_id=message.chat.id,
                 message_id=message.message_id,
                 business_connection_id=message.business_connection_id,
                 reply_markup=keyboard,
-                link_preview_options=preview_disabled
+                link_preview_options=LinkPreviewOptions(is_disabled=True)
             )
             edit_ok = True
-            logging.info(f"Оффер {temporary.id}: создан редактированием (ссылка вставлена сразу).")
+            logging.info(f"Оффер {temporary.id}: создан (ссылка добавится через 0.5с).")
         except Exception as edit_error:
-            # Если ссылка дала PEER_FLOOD на редактирование — пробуем без неё
-            if is_peer_flood(edit_error):
-                logging.warning(f"PEER_FLOOD при редактировании c ссылкой. Пробуем без ссылки...")
-                try:
-                    await bot.edit_message_text(
-                        text=text_without_link,
-                        chat_id=message.chat.id,
-                        message_id=message.message_id,
-                        business_connection_id=message.business_connection_id,
-                        reply_markup=keyboard,
-                        link_preview_options=preview_disabled
-                    )
-                    edit_ok = True
-                    # Запускаем таск для добавления ссылки потом (через 1 сек)
-                    asyncio.create_task(add_link_later(temporary, bot))
-                    logging.info(f"Оффер {temporary.id}: создан (сначала без ссылки, ссылка добавится позже).")
-                except Exception as e2:
-                    logging.warning(f"Не удалось и без ссылки: {e2!")
-            else:
-                logging.warning(f"Ошибка редактирования: {edit_error!r}")
+            logging.warning(f"Не удалось оформить оффер редактированием (шаг 1): {edit_error!r}")
 
         if edit_ok:
             temporary.message_id = message.message_id
+            # Запускаем Шаг 2: вставка ссылки асинхронно
+            asyncio.create_task(add_link_to_offer(temporary, bot))
         else:
-            # Запасной путь (отправка сообщения)
+            # Если Шага 1 не произошло — запасной путь с отправкой
             sent_msg = await safe_send_then_delete(
                 bot=bot,
-                text=final_text_with_link,
+                text=text_now,
                 chat_id=message.chat.id,
                 command_message_id=message.message_id,
                 business_connection_id=message.business_connection_id,
@@ -336,7 +316,7 @@ async def create_offer(message: Message, bot: Bot) -> None:
             )
             temporary.message_id = sent_msg.message_id
 
-        temporary.last_sent_text = final_text_with_link if edit_ok else ""
+        temporary.last_sent_text = text_now
         offers[temporary.id] = temporary
 
     except Exception as e:
@@ -404,7 +384,8 @@ async def refresh_loop(bot: Bot) -> None:
                 except Exception: pass
                 continue
 
-            new_text = proposal_text(offer)
+            # При обновлении таймера мы вставляем полную версию с ссылкой (если она не встала)
+            new_text = proposal_text_with_link(offer)
             if new_text != offer.last_sent_text:
                 try:
                     await safe_edit_message_text(
