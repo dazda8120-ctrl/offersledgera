@@ -1,6 +1,6 @@
 """Telegram Business assistant for non-official gift proposals.
-Команда: 'купить [ссылка на NFT] цена'
-Пример: 'купить t.me/nft/xxx 100'
+Команда: 'купить ЦЕНА' -> Бот отправляет оффер.
+Ссылка добавляется вручную. Таймер в тексте — статичный, из OFFER_TTL_HOURS.
 """
 
 import asyncio
@@ -21,6 +21,7 @@ from aiogram.types import (
     LinkPreviewOptions,
     Message,
 )
+# Попытка импортировать Flood ошибку из разных версий
 try:
     from aiogram.exceptions import TelegramRetryAfter
 except ImportError:
@@ -39,10 +40,11 @@ TOKEN = os.getenv("BOT_TOKEN", "")
 TTL_HOURS = int(os.getenv("OFFER_TTL_HOURS", "5"))
 
 router = Router()
-COMMAND_REGEX = re.compile(r"^купить\s+(.*)$", re.IGNORECASE | re.DOTALL)
-URL_REGEX = re.compile(r'(?:https?://|tg://|t\.me/)\S+', re.IGNORECASE)
+# Регулярка для разбора команды (только цена)
+COMMAND_REGEX = re.compile(r"^купить\s+(.*)$", re.IGNORECASE)
 GIFT_EMOJI_HTML = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
 
+# Кулдаун
 SEND_COOLDOWN_SECONDS = 2.0
 _last_send_time: float = 0.0
 _send_lock = asyncio.Lock()
@@ -72,10 +74,9 @@ class Offer:
     buyer_name: str
     price: str
     currency: str
-    owner_id: int
-    nft_url: str | None = None
 
 
+# Хранилище
 offers: dict[str, Offer] = {}
 
 
@@ -102,7 +103,7 @@ async def safe_send_message_text(
         except Exception as e:
             last_error = e
             if is_peer_flood(e):
-                wait = 60 * (attempt + 1)
+                wait = 60 * (attempt + 1)  # 60с, 120с, 180с... всё больше
                 logging.error(f"PEER_FLOOD, ждём {wait}с (попытка {attempt+1}/{MAX_PEER_FLOOD_RETRIES})")
                 await asyncio.sleep(wait)
                 continue
@@ -139,6 +140,10 @@ async def safe_edit_message_text(
 
 
 def parse_price(payload: str) -> str | None:
+    """
+    Парсит цену из строки после 'купить'.
+    Возвращает строку цены или None.
+    """
     parts = payload.split()
     for part in parts:
         try:
@@ -153,24 +158,12 @@ def parse_price(payload: str) -> str | None:
     return None
 
 
-def parse_payload(payload: str) -> tuple[str | None, str | None]:
-    url_match = URL_REGEX.search(payload)
-    nft_url = url_match.group(0) if url_match else None
-    remaining = URL_REGEX.sub('', payload)
-    price = parse_price(remaining)
-    return price, nft_url
-
-
 def offer_text(offer: Offer) -> str:
-    text = (
+    return (
         f"Пользователь <b>{html.escape(offer.buyer_name)}</b> предлагает Вам\n"
         f"<b>{offer.price} {offer.currency}</b> за подарок\n\n"
+        f"<b>Предложение действует ещё {TTL_HOURS}ч 59м.</b>"
     )
-    if offer.nft_url:
-        text += f'🔗 <a href="{html.escape(offer.nft_url)}">Ссылка на NFT</a>\n\n'
-    text += f"<b>Предложение действует ещё {TTL_HOURS}ч 59м.</b>"
-    return text
-
 
 def sold_text(offer: Offer) -> str:
     return (
@@ -178,12 +171,10 @@ def sold_text(offer: Offer) -> str:
         f"• Передайте подарок покупателю для зачисления {offer.currency}."
     )
 
-
 def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Передать", url=f"tg://user?id={offer.buyer_id}")],
     ])
-
 
 def proposal_keyboard(offer_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
@@ -194,52 +185,25 @@ def proposal_keyboard(offer_id: str) -> InlineKeyboardMarkup:
 
 @router.business_message(F.text)
 async def create_offer(message: Message, bot: Bot) -> None:
-    logging.info(
-        f"[business_message] text={message.text!r} "
-        f"from={(message.from_user.id if message.from_user else None)} "
-        f"conn_id={message.business_connection_id}"
-    )
-
     if not message.text or not message.business_connection_id:
-        logging.info("  -> нет text или conn_id, skip")
         return
 
     match = COMMAND_REGEX.fullmatch(message.text.strip())
-    logging.info(f"  -> regex: {match}")
-    if not match:
-        return
-
+    if not match: return
     payload = match.group(1).strip()
-    price, nft_url = parse_payload(payload)
-    logging.info(f"  -> payload={payload!r} price={price!r} url={nft_url!r}")
 
+    price = parse_price(payload)
+
+    # Валидация
     if price is None:
-        try:
-            await bot.send_message(
-                chat_id=message.chat.id,
-                text="Укажите цену! Пример: купить t.me/nft/xxx 100",
-                business_connection_id=message.business_connection_id,
-            )
-        except Exception as e:
-            logging.warning(f"Не смог ответить об ошибке: {e}")
+        await message.answer("Укажите цену! Пример: купить 100", quote=False)
         return
 
     currency = "TON" if "gram" in payload.lower() else "Stars"
 
     try:
         connection = await bot.get_business_connection(message.business_connection_id)
-        owner = connection.user
-        owner_id = owner.id
-        logging.info(f"  -> owner_id={owner_id}")
-
-        buyer = message.from_user
-        if not buyer:
-            logging.warning("  -> нет from_user, skip")
-            return
-
-        if buyer.id == owner_id:
-            logging.warning("  -> команда от владельца, создаю оффер (тестовый режим)")
-
+        buyer = connection.user
         buyer_id = buyer.id
         buyer_name = (
             f"@{buyer.username}" if getattr(buyer, "username", None)
@@ -256,62 +220,39 @@ async def create_offer(message: Message, bot: Bot) -> None:
             buyer_name=buyer_name,
             price=price,
             currency=currency,
-            owner_id=owner_id,
-            nft_url=nft_url,
         )
 
         text = offer_text(temp_offer)
         keyboard = proposal_keyboard(temp_offer.id)
 
-        logging.info(f"  -> отправляю оффер в chat_id={message.chat.id}")
         msg = await safe_send_message_text(
             bot, text, message.chat.id, message.business_connection_id, keyboard,
             LinkPreviewOptions(is_disabled=True)
         )
         temp_offer.message_id = msg.message_id
-        offers[offer_id] = temp_offer
-        logging.info(f"  -> оффер {offer_id} отправлен, msg_id={msg.message_id}")
 
-        try:
-            await bot.delete_business_messages(
-                message.business_connection_id, message_ids=[message.message_id]
-            )
-            logging.info("  -> сообщение покупателя удалено")
-        except Exception as e:
-            logging.warning(f"  -> не смог удалить: {e}")
+        offers[offer_id] = temp_offer
+
+        await bot.delete_business_messages(message.business_connection_id, message_ids=[message.message_id])
+        logging.info(f"Оффер {offer_id}: создан (цена {price} {currency}).")
 
     except Exception as e:
         if is_peer_flood(e):
-            logging.error(f"  -> PeerFlood: {e!r}")
+            logging.error(f"PeerFlood: {e!r}")
         else:
-            logging.exception(f"  -> ОШИБКА: {e}")
+            logging.exception(f"Error: {e}")
 
 
 @router.callback_query(F.data.startswith(("accept:", "decline:")))
 async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
-    logging.info(
-        f"[callback] data={callback.data!r} from={callback.from_user.id}"
-    )
     action, offer_id = callback.data.split(":", 1)
     offer = offers.get(offer_id)
     if not offer:
         await callback.answer("Оффер не найден.", show_alert=True)
         return
 
-    logging.info(f"  -> offer.owner_id={offer.owner_id}, clicker={callback.from_user.id}")
-
-    if callback.from_user.id != offer.owner_id:
-        await callback.answer(
-            "⛔ Только владелец может принять или отклонить предложение.",
-            show_alert=True
-        )
-        return
-
     if action == "decline":
-        await safe_edit_message_text(
-            bot, "❌ Предложение отклонено",
-            offer.chat_id, offer.message_id, offer.connection_id, None
-        )
+        await safe_edit_message_text(bot, "❌ Предложение отклонено", offer.chat_id, offer.message_id, offer.connection_id, None)
         offers.pop(offer_id, None)
         await callback.answer("Отклонено.")
     else:
@@ -322,16 +263,6 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
         )
         offers.pop(offer_id, None)
         await callback.answer("Принято.")
-
-
-@router.message()
-async def debug_all(message: Message) -> None:
-    logging.info(
-        f"[обычное сообщение] text={message.text!r} "
-        f"chat_type={message.chat.type} "
-        f"conn_id={message.business_connection_id} "
-        f"from={(message.from_user.id if message.from_user else None)}"
-    )
 
 
 async def main() -> None:
