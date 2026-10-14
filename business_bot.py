@@ -1,6 +1,6 @@
 """Telegram Business assistant for non-official gift proposals.
-Команда: 'купить ЦЕНА' -> Бот отправляет оффер.
-Ссылка добавляется вручную. Таймер в тексте — статичный, из OFFER_TTL_HOURS.
+Команда: 'купить [ссылка на NFT] цена' -> Бот отправляет оффер.
+Пример: 'купить t.me/nft/xxx 100'
 """
 
 import asyncio
@@ -40,8 +40,9 @@ TOKEN = os.getenv("BOT_TOKEN", "")
 TTL_HOURS = int(os.getenv("OFFER_TTL_HOURS", "5"))
 
 router = Router()
-# Регулярка для разбора команды (только цена)
+# Регулярка: 'купить' + всё остальное (ссылка и/или цена в любом порядке)
 COMMAND_REGEX = re.compile(r"^купить\s+(.*)$", re.IGNORECASE)
+URL_REGEX = re.compile(r'(?:https?://|tg://|t\.me/)\S+', re.IGNORECASE)
 GIFT_EMOJI_HTML = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
 
 # Кулдаун
@@ -74,6 +75,8 @@ class Offer:
     buyer_name: str
     price: str
     currency: str
+    owner_id: int                 # ID владельца бизнес-аккаунта (продавца)
+    nft_url: str | None = None    # ссылка на NFT
 
 
 # Хранилище
@@ -141,7 +144,7 @@ async def safe_edit_message_text(
 
 def parse_price(payload: str) -> str | None:
     """
-    Парсит цену из строки после 'купить'.
+    Парсит цену из строки (после вырезания URL).
     Возвращает строку цены или None.
     """
     parts = payload.split()
@@ -158,12 +161,29 @@ def parse_price(payload: str) -> str | None:
     return None
 
 
+def parse_payload(payload: str) -> tuple[str | None, str | None]:
+    """
+    Ожидаемый формат команды: 'купить [ссылка на NFT] цена'
+    (порядок ссылки и цены не критичен — оба вытаскиваются из строки).
+    Возвращает (price, nft_url).
+    """
+    url_match = URL_REGEX.search(payload)
+    nft_url = url_match.group(0) if url_match else None
+    remaining = URL_REGEX.sub('', payload)
+    price = parse_price(remaining)
+    return price, nft_url
+
+
 def offer_text(offer: Offer) -> str:
-    return (
+    text = (
         f"Пользователь <b>{html.escape(offer.buyer_name)}</b> предлагает Вам\n"
         f"<b>{offer.price} {offer.currency}</b> за подарок\n\n"
-        f"<b>Предложение действует ещё {TTL_HOURS}ч 59м.</b>"
     )
+    if offer.nft_url:
+        text += f'🔗 <a href="{html.escape(offer.nft_url)}">Ссылка на NFT</a>\n\n'
+    text += f"<b>Предложение действует ещё {TTL_HOURS}ч 59м.</b>"
+    return text
+
 
 def sold_text(offer: Offer) -> str:
     return (
@@ -171,10 +191,13 @@ def sold_text(offer: Offer) -> str:
         f"• Передайте подарок покупателю для зачисления {offer.currency}."
     )
 
+
 def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
+    # Открывает профиль покупателя
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Передать", url=f"tg://user?id={offer.buyer_id}")],
     ])
+
 
 def proposal_keyboard(offer_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
@@ -189,21 +212,35 @@ async def create_offer(message: Message, bot: Bot) -> None:
         return
 
     match = COMMAND_REGEX.fullmatch(message.text.strip())
-    if not match: return
+    if not match:
+        return
+
     payload = match.group(1).strip()
+    price, nft_url = parse_payload(payload)
 
-    price = parse_price(payload)
-
-    # Валидация
+    # Валидация: цена обязательна
     if price is None:
-        await message.answer("Укажите цену! Пример: купить 100", quote=False)
+        await message.answer(
+            "Укажите цену! Пример: купить t.me/nft/xxx 100",
+            quote=False
+        )
         return
 
     currency = "TON" if "gram" in payload.lower() else "Stars"
 
     try:
         connection = await bot.get_business_connection(message.business_connection_id)
-        buyer = connection.user
+        owner = connection.user
+        owner_id = owner.id
+
+        buyer = message.from_user
+        if not buyer:
+            return
+
+        # Игнорируем команды от самого владельца
+        if buyer.id == owner_id:
+            return
+
         buyer_id = buyer.id
         buyer_name = (
             f"@{buyer.username}" if getattr(buyer, "username", None)
@@ -220,6 +257,8 @@ async def create_offer(message: Message, bot: Bot) -> None:
             buyer_name=buyer_name,
             price=price,
             currency=currency,
+            owner_id=owner_id,
+            nft_url=nft_url,
         )
 
         text = offer_text(temp_offer)
@@ -233,7 +272,9 @@ async def create_offer(message: Message, bot: Bot) -> None:
 
         offers[offer_id] = temp_offer
 
-        await bot.delete_business_messages(message.business_connection_id, message_ids=[message.message_id])
+        await bot.delete_business_messages(
+            message.business_connection_id, message_ids=[message.message_id]
+        )
         logging.info(f"Оффер {offer_id}: создан (цена {price} {currency}).")
 
     except Exception as e:
@@ -251,8 +292,19 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer("Оффер не найден.", show_alert=True)
         return
 
+    # Кнопку может нажать ТОЛЬКО владелец (продавец)
+    if callback.from_user.id != offer.owner_id:
+        await callback.answer(
+            "⛔ Только владелец может принять или отклонить предложение.",
+            show_alert=True
+        )
+        return
+
     if action == "decline":
-        await safe_edit_message_text(bot, "❌ Предложение отклонено", offer.chat_id, offer.message_id, offer.connection_id, None)
+        await safe_edit_message_text(
+            bot, "❌ Предложение отклонено",
+            offer.chat_id, offer.message_id, offer.connection_id, None
+        )
         offers.pop(offer_id, None)
         await callback.answer("Отклонено.")
     else:
