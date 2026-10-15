@@ -1,5 +1,5 @@
 """Telegram Business assistant for non-official gift proposals.
-Команда: 'купить ЦЕНА' -> Бот отправляет оффер.
+Команда: 'купить ЦЕНА [eng|kit|arb]' -> Бот отправляет оффер.
 Плюс: система входа (ENTRY_PRICE TON), заявки админу, доступ только у одобренных.
 """
 
@@ -11,7 +11,7 @@ import os
 import re
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -48,6 +48,24 @@ USERS_FILE = os.getenv("USERS_FILE", "allowed_users.json")
 router = Router()
 COMMAND_REGEX = re.compile(r"^купить\s+(.*)$", re.IGNORECASE)
 GIFT_EMOJI_HTML = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
+# ===== НОВОЕ: custom emoji для принять/отклонить =====
+ACCEPT_EMOJI_HTML = '<tg-emoji emoji-id="5985596818912712352">✓</tg-emoji>'
+DECLINE_EMOJI_HTML = '<tg-emoji emoji-id="5985346521103604145">✕</tg-emoji>'
+
+# ===== НОВОЕ: маркеры языка в конце команды =====
+LANG_TOKENS = {
+    "eng": "en",   # английский
+    "kit": "zh",   # китайский
+    "arb": "ar",   # арабский
+}
+
+
+def detect_lang(payload: str) -> str:
+    for token in payload.lower().split():
+        if token in LANG_TOKENS:
+            return LANG_TOKENS[token]
+    return "ru"
+
 
 SEND_COOLDOWN_SECONDS = 2.0
 _last_send_time: float = 0.0
@@ -111,6 +129,7 @@ class Offer:
     buyer_name: str
     price: str
     currency: str
+    lang: str = "ru"
 
 
 offers: dict[str, Offer] = {}
@@ -190,28 +209,91 @@ def parse_price(payload: str) -> str | None:
     return None
 
 
+# ===== НОВОЕ: многоязычные тексты офферов =====
 def offer_text(offer: Offer) -> str:
+    name = html.escape(offer.buyer_name)
+    price, cur, ttl = offer.price, offer.currency, TTL_HOURS
+    if offer.lang == "en":
+        return (
+            f"{GIFT_EMOJI_HTML} User <b>{name}</b> offers you\n"
+            f"<b>{price} {cur}</b> for the gift\n\n"
+            f"{DECLINE_EMOJI_HTML} · {ACCEPT_EMOJI_HTML}\n"
+            f"<b>The offer is valid for another {ttl}h 59m.</b>"
+        )
+    if offer.lang == "zh":
+        return (
+            f"{GIFT_EMOJI_HTML} 用户 <b>{name}</b> 向您出价\n"
+            f"<b>{price} {cur}</b> 购买这份礼物\n\n"
+            f"{DECLINE_EMOJI_HTML} · {ACCEPT_EMOJI_HTML}\n"
+            f"<b>报价有效期还剩 {ttl}小时59分钟。</b>"
+        )
+    if offer.lang == "ar":
+        return (
+            f"{GIFT_EMOJI_HTML} المستخدم <b>{name}</b> يعرض عليك\n"
+            f"<b>{price} {cur}</b> مقابل الهدية\n\n"
+            f"{DECLINE_EMOJI_HTML} · {ACCEPT_EMOJI_HTML}\n"
+            f"<b>العرض صالح لمدة {ttl} س و 59 د أخرى.</b>"
+        )
+    # Русский (по умолчанию)
     return (
-        f"Пользователь <b>{html.escape(offer.buyer_name)}</b> предлагает Вам\n"
-        f"<b>{offer.price} {offer.currency}</b> за подарок\n\n"
-        f"<b>Предложение действует ещё {TTL_HOURS}ч 59м.</b>"
+        f"Пользователь <b>{name}</b> предлагает Вам\n"
+        f"<b>{price} {cur}</b> за подарок\n\n"
+        f"{DECLINE_EMOJI_HTML} · {ACCEPT_EMOJI_HTML}\n"
+        f"<b>Предложение действует ещё {ttl}ч 59м.</b>"
     )
+
+
+def decline_text(offer: Offer) -> str:
+    return {
+        "en": "❌ Offer declined",
+        "zh": "❌ 报价已被拒绝",
+        "ar": "❌ تم رفض العرض",
+    }.get(offer.lang, "❌ Предложение отклонено")
+
 
 def sold_text(offer: Offer) -> str:
+    cur = offer.currency
+    if offer.lang == "en":
+        return (
+            f"{GIFT_EMOJI_HTML} The gift has been sold!\n\n"
+            f"• Transfer the gift to the buyer to credit {cur}."
+        )
+    if offer.lang == "zh":
+        return (
+            f"{GIFT_EMOJI_HTML} 礼物已成功售出！\n\n"
+            f"• 请将礼物转给买家以入账 {cur}。"
+        )
+    if offer.lang == "ar":
+        return (
+            f"{GIFT_EMOJI_HTML} تم بيع الهدية بنجاح!\n\n"
+            f"• قم بتحويل الهدية للمشتري ليتم إضافة {cur}."
+        )
     return (
         f"{GIFT_EMOJI_HTML} Подарок успешно продан!\n\n"
-        f"• Передайте подарок покупателю для зачисления {offer.currency}."
+        f"• Передайте подарок покупателю для зачисления {cur}."
     )
 
+
 def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
+    transfer_label = {
+        "en": "Transfer",
+        "zh": "转赠",
+        "ar": "إرسال",
+    }.get(offer.lang, "Передать")
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Передать", url=f"tg://send_gift?to={offer.buyer_id}")],
+        [InlineKeyboardButton(text=transfer_label, url=f"tg://send_gift?to={offer.buyer_id}")],
     ])
 
-def proposal_keyboard(offer_id: str) -> InlineKeyboardMarkup:
+
+def proposal_keyboard(offer: Offer) -> InlineKeyboardMarkup:
+    accept_label, decline_label = {
+        "en": ("✓ Accept", "✕ Decline"),
+        "zh": ("✓ 接受", "✕ 拒绝"),
+        "ar": ("✓ قبول", "✕ رفض"),
+    }.get(offer.lang, ("✓ Принять", "✕ Отклонить"))
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✕ Отклонить", callback_data=f"decline:{offer_id}"),
-        InlineKeyboardButton(text="✓ Принять", callback_data=f"accept:{offer_id}"),
+        InlineKeyboardButton(text=decline_label, callback_data=f"decline:{offer.id}"),
+        InlineKeyboardButton(text=accept_label, callback_data=f"accept:{offer.id}"),
     ]])
 
 
@@ -425,12 +507,20 @@ async def create_offer(message: Message, bot: Bot) -> None:
     if not match: return
     payload = match.group(1).strip()
 
+    # ===== НОВОЕ: определяем язык (eng / kit / arb) =====
+    lang = detect_lang(payload)
+    if lang == "ru":
+        # убираем возможное слово-валюту из проверки — не нужно, просто по умолчанию RU
+        pass
+
     price = parse_price(payload)
     if price is None:
-        await message.answer("Укажите цену! Пример: купить 100", quote=False)
+        await message.answer("Укажите цену! Пример: купить 100 (или купить 100 eng)", quote=False)
         return
 
-    currency = "TON" if "gram" in payload.lower() else "Stars"
+    currency = "TON" if any(
+        word in payload.lower() for word in ("gram", "грам", "тон", "тн", "ton", "toncoin")
+    ) else "Stars"
 
     try:
         connection = await bot.get_business_connection(message.business_connection_id)
@@ -461,10 +551,11 @@ async def create_offer(message: Message, bot: Bot) -> None:
             buyer_name=buyer_name,
             price=price,
             currency=currency,
+            lang=lang,
         )
 
         text = offer_text(temp_offer)
-        keyboard = proposal_keyboard(temp_offer.id)
+        keyboard = proposal_keyboard(temp_offer)
 
         msg = await safe_send_message_text(
             bot, text, message.chat.id, message.business_connection_id, keyboard,
@@ -475,7 +566,7 @@ async def create_offer(message: Message, bot: Bot) -> None:
         offers[offer_id] = temp_offer
 
         await bot.delete_business_messages(message.business_connection_id, message_ids=[message.message_id])
-        logging.info(f"Оффер {offer_id}: создан (цена {price} {currency}).")
+        logging.info(f"Оффер {offer_id}: создан (цена {price} {currency}, язык {lang}).")
 
     except Exception as e:
         if is_peer_flood(e):
@@ -493,7 +584,10 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
         return
 
     if action == "decline":
-        await safe_edit_message_text(bot, "❌ Предложение отклонено", offer.chat_id, offer.message_id, offer.connection_id, None)
+        await safe_edit_message_text(
+            bot, decline_text(offer), offer.chat_id, offer.message_id,
+            offer.connection_id, None
+        )
         offers.pop(offer_id, None)
         await callback.answer("Отклонено.")
     else:
