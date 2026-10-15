@@ -173,7 +173,7 @@ def sold_text(offer: Offer) -> str:
 
 def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Передать", url=f"tg://user?id={offer.buyer_id}")],
+        [InlineKeyboardButton(text="Передать", url=f"tg://send_gift?to={offer.buyer_id}")],
     ])
 
 def proposal_keyboard(offer_id: str) -> InlineKeyboardMarkup:
