@@ -11,7 +11,7 @@ import os
 import re
 import secrets
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -48,11 +48,8 @@ USERS_FILE = os.getenv("USERS_FILE", "allowed_users.json")
 router = Router()
 COMMAND_REGEX = re.compile(r"^купить\s+(.*)$", re.IGNORECASE)
 GIFT_EMOJI_HTML = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
-# ===== НОВОЕ: custom emoji для принять/отклонить =====
-ACCEPT_EMOJI_HTML = '<tg-emoji emoji-id="5985596818912712352">✓</tg-emoji>'
-DECLINE_EMOJI_HTML = '<tg-emoji emoji-id="5985346521103604145">✕</tg-emoji>'
 
-# ===== НОВОЕ: маркеры языка в конце команды =====
+# Маркеры языка в конце команды
 LANG_TOKENS = {
     "eng": "en",   # английский
     "kit": "zh",   # китайский
@@ -209,36 +206,32 @@ def parse_price(payload: str) -> str | None:
     return None
 
 
-# ===== НОВОЕ: многоязычные тексты офферов =====
+# ===== Многоязычные тексты офферов =====
 def offer_text(offer: Offer) -> str:
     name = html.escape(offer.buyer_name)
     price, cur, ttl = offer.price, offer.currency, TTL_HOURS
     if offer.lang == "en":
         return (
-            f"{GIFT_EMOJI_HTML} User <b>{name}</b> offers you\n"
+            f"User <b>{name}</b> offers you\n"
             f"<b>{price} {cur}</b> for the gift\n\n"
-            f"{DECLINE_EMOJI_HTML} · {ACCEPT_EMOJI_HTML}\n"
             f"<b>The offer is valid for another {ttl}h 59m.</b>"
         )
     if offer.lang == "zh":
         return (
-            f"{GIFT_EMOJI_HTML} 用户 <b>{name}</b> 向您出价\n"
+            f"用户 <b>{name}</b> 向您出价\n"
             f"<b>{price} {cur}</b> 购买这份礼物\n\n"
-            f"{DECLINE_EMOJI_HTML} · {ACCEPT_EMOJI_HTML}\n"
             f"<b>报价有效期还剩 {ttl}小时59分钟。</b>"
         )
     if offer.lang == "ar":
         return (
-            f"{GIFT_EMOJI_HTML} المستخدم <b>{name}</b> يعرض عليك\n"
+            f"المستخدم <b>{name}</b> يعرض عليك\n"
             f"<b>{price} {cur}</b> مقابل الهدية\n\n"
-            f"{DECLINE_EMOJI_HTML} · {ACCEPT_EMOJI_HTML}\n"
             f"<b>العرض صالح لمدة {ttl} س و 59 د أخرى.</b>"
         )
     # Русский (по умолчанию)
     return (
         f"Пользователь <b>{name}</b> предлагает Вам\n"
         f"<b>{price} {cur}</b> за подарок\n\n"
-        f"{DECLINE_EMOJI_HTML} · {ACCEPT_EMOJI_HTML}\n"
         f"<b>Предложение действует ещё {ttl}ч 59м.</b>"
     )
 
@@ -507,17 +500,15 @@ async def create_offer(message: Message, bot: Bot) -> None:
     if not match: return
     payload = match.group(1).strip()
 
-    # ===== НОВОЕ: определяем язык (eng / kit / arb) =====
+    # Определяем язык (eng / kit / arb)
     lang = detect_lang(payload)
-    if lang == "ru":
-        # убираем возможное слово-валюту из проверки — не нужно, просто по умолчанию RU
-        pass
 
     price = parse_price(payload)
     if price is None:
         await message.answer("Укажите цену! Пример: купить 100 (или купить 100 eng)", quote=False)
         return
 
+    # Тон/грамм/ton/gram в любой раскладке -> валюта TON
     currency = "TON" if any(
         word in payload.lower() for word in ("gram", "грам", "тон", "тн", "ton", "toncoin")
     ) else "Stars"
