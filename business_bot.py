@@ -1,7 +1,4 @@
-"""Telegram Business assistant for non-official gift proposals.
-Команда: 'купить ЦЕНА [eng|kit|arb]' -> Бот отправляет оффер.
-Плюс: система входа (ENTRY_PRICE TON), заявки админу, доступ только у одобренных.
-"""
+# -*- coding: utf-8 -*-
 
 import asyncio
 import html
@@ -144,9 +141,12 @@ async def safe_send_message_text(
     for attempt in range(MAX_PEER_FLOOD_RETRIES):
         try:
             return await bot.send_message(
-                chat_id=chat_id, text=text,
+                chat_id=chat_id, 
+                text=text, 
+                parse_mode="HTML",  # Явное указание формата HTML
                 business_connection_id=business_connection_id,
-                reply_markup=reply_markup, link_preview_options=link_preview_options
+                reply_markup=reply_markup, 
+                link_preview_options=link_preview_options
             )
         except TelegramRetryAfter as e:
             wait_time = e.retry_after if hasattr(e, 'retry_after') else 30
@@ -175,9 +175,13 @@ async def safe_edit_message_text(
     for attempt in range(max_retries):
         try:
             await bot.edit_message_text(
-                text=text, chat_id=chat_id, message_id=message_id,
+                text=text, 
+                chat_id=chat_id, 
+                message_id=message_id,
+                parse_mode="HTML",  # Явное указание формата HTML
                 business_connection_id=business_connection_id,
-                reply_markup=reply_markup, link_preview_options=link_preview_options
+                reply_markup=reply_markup, 
+                link_preview_options=link_preview_options
             )
             return
         except TelegramRetryAfter as e:
