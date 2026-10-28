@@ -315,26 +315,18 @@ def proposal_keyboard(offer: Offer) -> InlineKeyboardMarkup:
 
 # ===== Текст для всплывающего окна (Alert) при принятии оффера =====
 def accept_alert_text(offer: Offer) -> str:
-    # Берем имя покупателя (уже отформатировано как @username или Full Name)
     buyer_handle = offer.buyer_name
-    
-    # Красиво обрабатываем валюту (например, для звезд)
     currency = offer.currency
     currency_text_ru = "звезд" if currency == "Stars" else currency
 
-    # Пытаемся извлечь красивое имя подарка из ссылки (например, t.me/nft/JesterHat-7417 -> Jester Hat #7417)
+    # Пытаемся извлечь красивое имя подарка из ссылки
     gift_name = offer.gift_link
     if "t.me/" in gift_name or "http" in gift_name:
         parts = gift_name.split("/")
         if len(parts) > 0:
             last_part = parts[-1]
-            # Заменяем дефисы на решетку и добавляем пробелы перед заглавными буквами
             last_part = last_part.replace("-", " #")
             gift_name = re.sub(r'(?<!^)(?=[A-Z])', ' ', last_part).strip()
-    
-    # Если название пустое или ссылка не распозналась, используем дефолт
-    if not gift_name:
-        gift_name = "подарок"
 
     if offer.lang == "en":
         return (
@@ -352,9 +344,15 @@ def accept_alert_text(offer: Offer) -> str:
             f"قم بتحويل الهدية إلى {buyer_handle} لإضافة {offer.price} {currency} إلى رصيدك."
         )
     
-    # Русский (по умолчанию)
+    # ===== ИСПРАВЛЕНИЕ ГРАММАТИКИ ДЛЯ РУССКОГО ЯЗЫКА =====
+    # Если ссылки не было, gift_name равно "подарок". Меняем на "подарка" (родительный падеж).
+    if not gift_name or gift_name == "подарок":
+        display_gift = "подарка"
+    else:
+        display_gift = gift_name
+
     return (
-        f"Предложение о продаже {gift_name} успешно принято.\n\n"
+        f"Предложение о продаже {display_gift} успешно принято.\n\n"
         f"Передайте подарок {buyer_handle} для зачисления {offer.price} {currency_text_ru} на ваш баланс."
     )
 
@@ -678,6 +676,7 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
         offers.pop(offer_id, None)
         await callback.answer("Отклонено.")
     else:
+        # 1. Меняем сообщение в чате (тут появляется кнопка "Передать")
         text = sold_text(offer)
         await safe_edit_message_text(
             bot, text, offer.chat_id, offer.message_id,
@@ -685,10 +684,8 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
         )
         offers.pop(offer_id, None)
         
-        # ===== ИЗМЕНЕНИЯ ЗДЕСЬ =====
-        # Генерируем текст для модального окна
+        # 2. Показываем всплывающее окно с предупреждением
         alert_text = accept_alert_text(offer)
-        # Показываем полноценное всплывающее окно с кнопкой ОК
         await callback.answer(alert_text, show_alert=True)
 
 
