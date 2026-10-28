@@ -127,6 +127,7 @@ class Offer:
     price: str
     currency: str
     lang: str = "ru"
+    buyer_username: str = ""  # ВОЗВРАЩЕНО ДЛЯ КОРРЕКТНОЙ ССЫЛКИ
 
 
 offers: dict[str, Offer] = {}
@@ -163,34 +164,6 @@ async def safe_send_message_text(
     if last_error: raise last_error
 
 
-async def safe_edit_message_text(
-    bot: Bot, text: str, chat_id: int, message_id: int,
-    business_connection_id: str | None = None,
-    reply_markup: InlineKeyboardMarkup | None = None,
-    link_preview_options: LinkPreviewOptions | None = None
-) -> None:
-    if link_preview_options is None:
-        link_preview_options = LinkPreviewOptions(is_disabled=True)
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            await bot.edit_message_text(
-                text=text, chat_id=chat_id, message_id=message_id,
-                business_connection_id=business_connection_id,
-                reply_markup=reply_markup, link_preview_options=link_preview_options
-            )
-            return
-        except TelegramRetryAfter as e:
-            wait_time = e.retry_after if hasattr(e, 'retry_after') else 60
-            if attempt == max_retries - 1: raise e
-            logging.info(f"Edit Flood Wait ({wait_time}s).")
-            await asyncio.sleep(wait_time)
-        except Exception as e:
-            logging.debug(f"Edit failed: {e}")
-            if attempt == max_retries - 1: raise e
-            await asyncio.sleep(1)
-
-
 def parse_price(payload: str) -> str | None:
     parts = payload.split()
     for part in parts:
@@ -216,21 +189,21 @@ def offer_text(offer: Offer) -> str:
         return (
             f"User <b>{name}</b> offers you\n"
             f"<b>{price} {cur}</b> for the gift\n\n"
-            f"The offer is valid for another <b>{ttl}h{nbsp}59m.</b>"
+            f"<b>The offer is valid for another {ttl}h 59m.</b>"
         )
     if offer.lang == "zh":
         return (
             f"用户 <b>{name}</b> 向您出价\n"
             f"<b>{price} {cur}</b> 购买这份礼物\n\n"
-            f"报价有效期还剩 <b>{ttl}小时59分钟。</b>"
+            f"<b>报价有效期还剩 {ttl}小时59分钟。</b>"
         )
     if offer.lang == "ar":
         return (
             f"المستخدم <b>{name}</b> يعرض عليك\n"
             f"<b>{price} {cur}</b> مقابل الهدية\n\n"
-            f"العرض صالح لمدة <b>{ttl}{nbsp}س{nbsp}و{nbsp}59{nbsp}د أخرى.</b>"
+            f"<b>العرض صالح لمدة {ttl} س و 59 د أخرى.</b>"
         )
-    # Русский (по умолчанию) - ВОЗВРАЩЕН ОРИГИНАЛЬНЫЙ ТЕКСТ
+    # Русский (по умолчанию) - ИСПРАВЛЕН (возвращен оригинальный вид)
     return (
         f"Пользователь <b>{name}</b> предлагает\n"
         f"Вам <b>{price} {cur}</b> за подарок\n\n"
@@ -275,8 +248,12 @@ def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
         "zh": "转赠",
         "ar": "إرسال",
     }.get(offer.lang, "Передать")
+    
+    # ИСПОЛЬЗУЕМ ЮЗЕРНЕЙМ (строку), а не ID (число)
+    recipient = offer.buyer_username if offer.buyer_username else str(offer.buyer_id)
+    
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=transfer_label, url=f"tg://send_gift?to={offer.buyer_id}")],
+        [InlineKeyboardButton(text=transfer_label, url=f"tg://send_gift?to={recipient}")],
     ])
 
 
@@ -562,6 +539,8 @@ async def create_offer(message: Message, bot: Bot) -> None:
             f"@{buyer.username}" if getattr(buyer, "username", None)
             else (buyer.full_name if hasattr(buyer, "full_name") else f"id{buyer.id}")
         )
+        
+        buyer_username = buyer.username if buyer.username else str(buyer.id)
 
         offer_id = secrets.token_urlsafe(8)
         temp_offer = Offer(
@@ -574,6 +553,7 @@ async def create_offer(message: Message, bot: Bot) -> None:
             price=price,
             currency=currency,
             lang=lang,
+            buyer_username=buyer_username,
         )
 
         text = offer_text(temp_offer)
@@ -606,22 +586,37 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
         return
 
     if action == "decline":
-        await safe_edit_message_text(
-            bot, decline_text(offer), offer.chat_id, offer.message_id,
-            offer.connection_id, None
-        )
+        try:
+            # Используем callback.message.edit_text для надежности в бизнес-чатах
+            await callback.message.edit_text(
+                text=decline_text(offer),
+                reply_markup=None
+            )
+        except Exception as e:
+            logging.error(f"Ошибка при редактировании (отклонение): {e}")
+        
         offers.pop(offer_id, None)
         await callback.answer("Отклонено.")
     else:
         text = sold_text(offer)
-        await safe_edit_message_text(
-            bot, text, offer.chat_id, offer.message_id,
-            offer.connection_id, sold_keyboard(offer)
-        )
+        try:
+            # Используем callback.message.edit_text для надежности в бизнес-чатах
+            await callback.message.edit_text(
+                text=text,
+                reply_markup=sold_keyboard(offer)
+            )
+        except Exception as e:
+            logging.error(f"Ошибка при редактировании (принятие): {e}")
+        
         offers.pop(offer_id, None)
         
-        # ===== ВЫЗОВ ВСПЛЫВАЮЩЕГО ОКНА (ALERT) =====
+        # ВЫЗОВ ВСПЛЫВАЮЩЕГО ОКНА (ALERT)
         alert_text = accept_alert_text(offer)
+        
+        # Защита от ошибки, если текст в окне превышает лимит Telegram (200 символов)
+        if len(alert_text) > 200:
+            alert_text = alert_text[:197] + "..."
+            
         await callback.answer(alert_text, show_alert=True)
 
 
