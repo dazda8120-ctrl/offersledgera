@@ -269,38 +269,11 @@ def proposal_keyboard(offer: Offer) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text=acc, callback_data=f"accept:{offer.id}"),
     ]])
 
-# === ИСПРАВЛЕННОЕ ПРЕДУПРЕЖДЕНИЕ (Alert) (как в запросе) ===
+# === УБРАЛ OKNO (Алерт) ===
+# Просто ответ для callback (костыль, чтобы не было ошибки, если окно не нужно)
 def accept_alert_text(offer: Offer) -> str:
-    buyer = offer.buyer_name
-    cur = offer.currency
-    # Перевод валюты для RU (Stars -> звезд)
-    cur_ru = "звезд" if cur == "Stars" else cur
-    
-    # Обработка имени подарка
-    gift = offer.gift_link
-    if "t.me/" in gift or "http" in gift:
-        parts = gift.split("/")
-        if len(parts) > 0:
-            gift = parts[-1].replace("-", " #")
-            gift = re.sub(r'(?<!^)(?=[A-Z])', ' ', gift).strip()
-    
-    # Склонение русского
-    disp_gift = "подарка" if not gift or gift == "подарок" else gift
+    return "Принято." 
 
-    if offer.lang == "ru":
-        # Текст точно как просили
-        return (
-            f"Предложение о продаже {disp_gift}\n"
-            f"успешно принято.\n\n"
-            f"Передайте подарок\n"
-            f"{buyer} для зачисления\n"
-            f"{offer.price} {cur_ru} на ваш баланс."
-        )
-    
-    # Довес для других языков (оставил логичный)
-    if offer.lang == "en":
-        return f"Offer to sell {disp_gift} successfully accepted.\n\nTransfer gift to {buyer} to receive {offer.price} {cur}."
-    return "Accepted."
 
 # ===== /start =====
 @router.message(CommandStart(), F.chat.type == "private")
@@ -435,7 +408,7 @@ async def create_offer(message: Message, bot: Bot) -> None:
     except Exception as e:
         logging.exception(f"Error create: {e}")
 
-# ===== Принятие / Отклонение =====
+# ===== Принятие / Отклонение (БЕЗ ВСПЛЫВАЮЩЕГО ОКНА) =====
 @router.callback_query(F.data.startswith(("accept:", "decline:")))
 async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
     if ":" not in callback.data: return
@@ -454,6 +427,7 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
             text = sold_text(offer)
             kb = sold_keyboard(offer)
             
+            # Просто редактируем сообщение
             await safe_edit_message_text(
                 bot, text, offer.chat_id, offer.message_id, 
                 offer.connection_id, kb, 
@@ -463,7 +437,8 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
             offers.pop(offer_id, None)
             logging.info(f"Оффер {offer_id}: ПРИНЯТ")
             
-            await callback.answer(accept_alert_text(offer), show_alert=True)
+            # Без всплывающего окна
+            await callback.answer("Принято")
 
     except Exception as e:
         logging.exception(f"Resolve error: {e}")
