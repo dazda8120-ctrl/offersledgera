@@ -42,7 +42,7 @@ router = Router()
 COMMAND_REGEX = re.compile(r"^купить\s+(.*)$", re.IGNORECASE)
 GIFT_EMOJI_HTML = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
 
-# 1. Добавлен "ru"
+# Жесткий список языков (ru теперь обязателен для русского)
 LANG_TOKENS = {
     "eng": "en",
     "kit": "zh",
@@ -50,7 +50,7 @@ LANG_TOKENS = {
     "ru": "ru",
 }
 
-# 2. Теперь возвращает None, если язык не указан
+# Теперь возвращает None, если язык не указан
 def detect_lang(payload: str) -> str | None:
     for token in payload.lower().split():
         if token in LANG_TOKENS:
@@ -223,7 +223,6 @@ def proposal_keyboard(offer: Offer) -> InlineKeyboardMarkup:
 
 def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
     transfer_label = {"en": "Transfer", "zh": "转赠", "ar": "إرسال"}.get(offer.lang, "Передать")
-    # Главная защита: если username нет, ставим резервный.
     recipient = offer.buyer_username if (offer.buyer_username and not offer.buyer_username.isdigit()) else GIFT_RECIPIENT
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=transfer_label, url=f"tg://send_gift?to={recipient}")],
@@ -235,7 +234,6 @@ async def cmd_start(message: Message, bot: Bot) -> None:
     user = message.from_user
     if not user: return
     if user.id == ADMIN_ID or user.id in allowed_users:
-        # 3. Обновил подсказку, чтобы юзер знал про обязательный ru
         await message.answer("Привет! 👋\n\nУ вас уже есть доступ к офферам ✅\nПишите в чат с бизнесом команду: <code>купить ЦЕНА ru</code> (или eng, kit, arb)")
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔑 Купить вход", callback_data="entry:start")]])
@@ -339,7 +337,7 @@ async def create_offer(message: Message, bot: Bot) -> None:
     payload = match.group(1).strip()
     lang = detect_lang(payload)
     
-    # 4. Жесткая проверка: если языка нет - выдаем ошибку и не создаем оффер
+    # Жесткая проверка языка (только ru, eng, kit, arb)
     if not lang:
         await message.answer(
             "❌ Укажите язык в конце команды!\nПример: <code>купить 100 ru</code> (или eng, kit, arb)",
@@ -385,7 +383,7 @@ async def create_offer(message: Message, bot: Bot) -> None:
     except Exception as e:
         logging.exception(f"Error: {e}")
 
-# ===== Обработка кнопок "Принять" и "Отклонить" =====
+# ===== Обработка кнопок "Принять" и "Отклонить" (С ОБХОДОМ ОГРАНИЧЕНИЯ КОНТАКТОВ) =====
 @router.callback_query(F.data.startswith(("accept:", "decline:")))
 async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
     action, offer_id = callback.data.split(":", 1)
@@ -410,8 +408,9 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
         text = sold_text(offer)
         kb = sold_keyboard(offer)
         
+        edited = False
         try:
-            # ВАЖНО: используем bot.edit_message_text с business_connection_id для обновления у продавца
+            # Пытаемся отредактировать старое сообщение (сработает, если отправитель в контактах)
             await bot.edit_message_text(
                 text=text,
                 chat_id=offer.chat_id,
@@ -419,9 +418,13 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
                 business_connection_id=offer.connection_id,
                 reply_markup=kb
             )
+            edited = True
         except Exception as e:
-            logging.error(f"Ошибка при редактировании (принятие): {e}")
-            # Если редактирование не удалось, отправляем новое сообщение
+            # Если не сработало (потому что не в контактах), просто игнорируем ошибку и идем дальше
+            logging.warning(f"Редактирование заблокировано Telegram: {e}")
+        
+        # Если редактирование не удалось (пользователь не в контактах), ОТПРАВЛЯЕМ НОВОЕ СООБЩЕНИЕ
+        if not edited:
             try:
                 await safe_send_message_text(
                     bot, text, offer.chat_id, offer.connection_id, kb
@@ -431,7 +434,7 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
         
         offers.pop(offer_id, None)
         
-        # Показываем окно
+        # Показываем окно с кнопкой ОК
         alert_text = accept_alert_text(offer)
         if len(alert_text) > 200:
             alert_text = alert_text[:197] + "..."
