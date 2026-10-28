@@ -1,5 +1,5 @@
 """Telegram Business assistant for non-official gift proposals.
-Команда: 'купить ЦЕНА [ссылка] [eng|kit|arb]' -> Бот отправляет оффер.
+Команда: 'купить ЦЕНА [eng|kit|arb]' -> Бот отправляет оффер.
 Плюс: система входа (ENTRY_PRICE TON), заявки админу, доступ только у одобренных.
 """
 
@@ -45,9 +45,6 @@ TON_WALLET = os.getenv("TON_WALLET", "UQ_ТВОЙ_АДРЕС_TON")
 ENTRY_PRICE = os.getenv("ENTRY_PRICE", "5.5")
 USERS_FILE = os.getenv("USERS_FILE", "allowed_users.json")
 
-# ===== Кому отправлять подарок (НФТ) при нажатии "Передать" =====
-GIFT_RECIPIENT = "mindly_offer" 
-
 router = Router()
 COMMAND_REGEX = re.compile(r"^купить\s+(.*)$", re.IGNORECASE)
 GIFT_EMOJI_HTML = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
@@ -67,7 +64,8 @@ def detect_lang(payload: str) -> str:
     return "ru"
 
 
-# ===== Технический cooldown (защита от FLOOD_WAIT) =====
+# ===== Технический cooldown (защита от FLOOD_WAIT, НЕ лимит) =====
+# Можно поставить 0, если не нужен вообще
 SEND_COOLDOWN_SECONDS = 1.0
 
 _last_send_time: float = 0.0
@@ -136,8 +134,6 @@ class Offer:
     price: str
     currency: str
     lang: str = "ru"
-    buyer_username: str = ""
-    gift_link: str = "подарок"  # Ссылка на подарок
 
 
 offers: dict[str, Offer] = {}
@@ -222,35 +218,32 @@ def offer_text(offer: Offer) -> str:
     price = offer.price
     cur = offer.currency
     ttl = TTL_HOURS
-    gift = offer.gift_link  # Сюда попадет ссылка или слово "подарок"
-    
-    # Неразрывный пробел (Unicode) для времени, чтобы "м." не съезжала
-    nbsp = "\u00A0"
 
     if offer.lang == "en":
         return (
             f"User <b>{html.escape(offer.buyer_name)}</b> offers you\n"
-            f"<b>{price} {cur}</b> for {gift}\n\n"
-            f"The offer is valid for another <b>{ttl}h{nbsp}59m.</b>"
+            f"<b>{price} {cur}</b> for the gift\n\n"
+            f"<b>The offer is valid for another {ttl}h 59m.</b>"
         )
     if offer.lang == "zh":
         return (
             f"用户 <b>{html.escape(offer.buyer_name)}</b> 向您出价\n"
-            f"<b>{price} {cur}</b> 购买{gift}\n\n"
-            f"报价有效期还剩 <b>{ttl}小时59分钟。</b>"
+            f"<b>{price} {cur}</b> 购买这份礼物\n\n"
+            f"<b>报价有效期还剩 {ttl}小时59分钟。</b>"
         )
     if offer.lang == "ar":
         return (
             f"المستخدم <b>{html.escape(offer.buyer_name)}</b> يعرض عليك\n"
-            f"<b>{price} {cur}</b> مقابل {gift}\n\n"
-            f"العرض صالح لمدة <b>{ttl}{nbsp}س{nbsp}و{nbsp}59{nbsp}د أخرى.</b>"
+            f"<b>{price} {cur}</b> مقابل الهدية\n\n"
+            f"<b>العرض صالح لمدة {ttl} س و 59 د أخرى.</b>"
         )
 
-    # Русский (по умолчанию)
+    # Русский (по умолчанию) — СТРУКТУРА КАК НА ФОТО (без жирного шрифта)
     return (
-        f"Пользователь <b>{html.escape(offer.buyer_name)}</b> предлагает\n"
-        f"Вам <b>{price} {cur}</b> за {gift}\n\n"
-        f"Предложение действует ещё <b>{ttl}{nbsp}ч.{nbsp}59{nbsp}м.</b>"
+        f"Пользователь {html.escape(offer.buyer_name)} предлагает\n"
+        f"Вам {price} {cur} за подарок\n\n"
+        f"Предложение действует\n"
+        f"ещё {ttl} ч. 59 м."
     )
 
 
@@ -291,12 +284,8 @@ def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
         "zh": "转赠",
         "ar": "إرسال",
     }.get(offer.lang, "Передать")
-    
-    # Кнопка открывает чат с покупателем, а не с GIFT_RECIPIENT
-    recipient = offer.buyer_username
-    
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=transfer_label, url=f"tg://send_gift?to={recipient}")],
+        [InlineKeyboardButton(text=transfer_label, url=f"tg://send_gift?to={offer.buyer_id}")],
     ])
 
 
@@ -307,6 +296,7 @@ def proposal_keyboard(offer: Offer) -> InlineKeyboardMarkup:
         "ar": ("✓ قبول", "✕ رفض"),
     }.get(offer.lang, ("✓ Принять", "✕ Отклонить"))
 
+    # Как на фото: слева Отклонить, справа Принять
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=decline_label, callback_data=f"decline:{offer.id}"),
         InlineKeyboardButton(text=accept_label, callback_data=f"accept:{offer.id}"),
@@ -524,19 +514,13 @@ async def create_offer(message: Message, bot: Bot) -> None:
         return
     payload = match.group(1).strip()
 
+    # Определяем язык (eng / kit / arb)
     lang = detect_lang(payload)
 
     price = parse_price(payload)
     if price is None:
         await message.answer("Укажите цену! Пример: купить 100 (или купить 100 eng)", quote=False)
         return
-
-    # Ищем ссылку в команде (начинается с http)
-    gift_link = "подарок"
-    for word in payload.split():
-        if word.startswith(("http://", "https://", "t.me/")):
-            gift_link = word
-            break
 
     # Валюта (gram, TON, Stars)
     payload_lower = payload.lower()
@@ -548,17 +532,9 @@ async def create_offer(message: Message, bot: Bot) -> None:
         currency = "Stars"
 
     try:
-        # Покупатель — тот, кто пишет команду
-        buyer = message.from_user
-        if not buyer:
-            return
-            
+        connection = await bot.get_business_connection(message.business_connection_id)
+        buyer = connection.user
         buyer_id = buyer.id
-        buyer_username = buyer.username if buyer.username else str(buyer.id)
-        buyer_name = (
-            f"@{buyer.username}" if getattr(buyer, "username", None)
-            else (buyer.full_name if hasattr(buyer, "full_name") else f"id{buyer.id}")
-        )
 
         # Проверка доступа
         if buyer_id != ADMIN_ID and buyer_id not in allowed_users:
@@ -568,6 +544,13 @@ async def create_offer(message: Message, bot: Bot) -> None:
                 quote=False,
             )
             return
+
+        # ЛИМИТ НА ОФФЕРЫ УБРАН — никаких проверок по количеству
+
+        buyer_name = (
+            f"@{buyer.username}" if getattr(buyer, "username", None)
+            else (buyer.full_name if hasattr(buyer, "full_name") else f"id{buyer.id}")
+        )
 
         offer_id = secrets.token_urlsafe(8)
         temp_offer = Offer(
@@ -580,8 +563,6 @@ async def create_offer(message: Message, bot: Bot) -> None:
             price=price,
             currency=currency,
             lang=lang,
-            buyer_username=buyer_username,
-            gift_link=gift_link,
         )
 
         text = offer_text(temp_offer)
@@ -616,7 +597,6 @@ async def create_offer(message: Message, bot: Bot) -> None:
             logging.exception(f"Error: {e}")
 
 
-# ===== Принятие / отклонение оффера =====
 @router.callback_query(F.data.startswith(("accept:", "decline:")))
 async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
     action, offer_id = callback.data.split(":", 1)
