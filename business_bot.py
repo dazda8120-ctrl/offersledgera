@@ -220,6 +220,7 @@ def proposal_keyboard(offer: Offer) -> InlineKeyboardMarkup:
 
 def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
     transfer_label = {"en": "Transfer", "zh": "转赠", "ar": "إرسال"}.get(offer.lang, "Передать")
+    # Обход ошибки: если username нет, ставим резервный
     recipient = offer.buyer_username if (offer.buyer_username and not offer.buyer_username.isdigit()) else GIFT_RECIPIENT
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=transfer_label, url=f"tg://send_gift?to={recipient}")],
@@ -371,7 +372,7 @@ async def create_offer(message: Message, bot: Bot) -> None:
     except Exception as e:
         logging.exception(f"Error: {e}")
 
-# ===== Обработка кнопок "Принять" и "Отклонить" (ОБХОД БАГА) =====
+# ===== Обработка кнопок "Принять" и "Отклонить" (ТРОЙНАЯ ЗАЩИТА) =====
 @router.callback_query(F.data.startswith(("accept:", "decline:")))
 async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
     action, offer_id = callback.data.split(":", 1)
@@ -384,65 +385,55 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
 
     if action == "decline":
         try:
-            await bot.edit_message_text(
-                text=decline_text(offer),
-                chat_id=offer.chat_id,
-                message_id=offer.message_id,
-                business_connection_id=offer.connection_id,
-                reply_markup=None
-            )
-        except Exception as e:
-            logging.error(f"Edit error (decline): {e}")
+            await callback.message.edit_text(text=decline_text(offer), reply_markup=None)
+        except Exception:
+            try:
+                await bot.edit_message_text(text=decline_text(offer), chat_id=offer.chat_id, message_id=offer.message_id, business_connection_id=offer.connection_id, reply_markup=None)
+            except Exception: pass
         await callback.answer("Отклонено.")
         return
 
-    # ===== ОБХОД БАГА TELEGRAM: ОТПРАВЛЯЕМ НОВОЕ СООБЩЕНИЕ =====
     text = sold_text(offer)
     kb = sold_keyboard(offer)
+    
+    edited_successfully = False
 
-    # 1. Отправляем НОВОЕ сообщение с текстом "Подарок продан" и кнопкой "Передать".
-    # Это сообщение гарантированно увидят ОБА участника, баг с кириллицей на него не действует.
+    # Способ 1: Редактируем для покупателя (через callback)
     try:
-        await safe_send_message_text(bot, text, offer.chat_id, offer.connection_id, kb)
+        await callback.message.edit_text(text=text, reply_markup=kb)
+        edited_successfully = True
     except Exception as e:
-        logging.error(f"Send new sold message error: {e}")
+        logging.error(f"Способ 1 не сработал: {e}")
 
-    # 2. Со старого сообщения убираем кнопки, чтобы нельзя было нажать повторно.
+    # Способ 2: Редактируем для продавца (через business_connection_id)
     try:
         await bot.edit_message_text(
-            text="✅ Оффер обработан",
-            chat_id=offer.chat_id,
-            message_id=offer.message_id,
-            business_connection_id=offer.connection_id,
-            reply_markup=None
+            text=text, chat_id=offer.chat_id, message_id=offer.message_id,
+            business_connection_id=offer.connection_id, reply_markup=kb
         )
+        edited_successfully = True
     except Exception as e:
-        logging.error(f"Edit old message error: {e}")
-        # Если отредактировать не удалось, пробуем удалить старое сообщение
-        try:
-            await bot.delete_business_messages(
-                offer.connection_id, message_ids=[offer.message_id]
-            )
-        except Exception as e2:
-            logging.error(f"Delete old message error: {e2}")
+        logging.error(f"Способ 2 не сработал: {e}")
 
-    # 3. Показываем всплывающее окно (Alert).
+    # Способ 3 (ФОЛБЭК): Если оба редактирования провалились (баг с русским языком), 
+    # отправляем НОВОЕ сообщение и удаляем старое.
+    if not edited_successfully:
+        logging.warning("Редактирование не удалось. Отправляем новое сообщение.")
+        try:
+            await safe_send_message_text(bot, text, offer.chat_id, offer.connection_id, kb)
+            try:
+                await bot.delete_business_messages(offer.connection_id, message_ids=[offer.message_id])
+            except Exception as e_del:
+                logging.error(f"Не удалось удалить старое сообщение: {e_del}")
+        except Exception as e_send:
+            logging.error(f"Фолбэк отправка не удалась: {e_send}")
+
+    # Показываем окно
     alert_text = accept_alert_text(offer)
     if len(alert_text) > 200:
         alert_text = alert_text[:197] + "..."
     try:
         await callback.answer(alert_text, show_alert=True)
     except Exception as e:
-        logging.error(f"Alert error: {e}")
+        logging.error(f"Ошибка окна: {e}")
         await callback.answer("Принято.")
-
-async def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
-    bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"), timeout=15)
-    dp = Dispatcher()
-    dp.include_router(router)
-    try: await dp.start_polling(bot)
-    finally: await bot.session.close()
-
-if __name__ == "__main__":
-    asyncio.run(main())
