@@ -1,5 +1,5 @@
 """Telegram Business assistant for non-official gift proposals.
-Команда: 'купить ЦЕНА [ссылка] [eng|kit|arb]' -> Бот отправляет оффер.
+Команда: 'купить ЦЕНА [ссылка] [eng|kit|arb|ру]' -> Бот отправляет оффер.
 Плюс: система входа (ENTRY_PRICE TON), заявки админу, доступ только у одобренных.
 """
 
@@ -50,10 +50,12 @@ COMMAND_REGEX = re.compile(r"^купить\s+(.*)$", re.IGNORECASE)
 GIFT_EMOJI_HTML = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
 
 # Маркеры языка в конце команды
+# Добавлено "ру" для явного указания русского языка
 LANG_TOKENS = {
     "eng": "en",   # английский
     "kit": "zh",   # китайский
     "arb": "ar",   # арабский
+    "ру": "ru",    # русский (добавлено)
 }
 
 
@@ -316,6 +318,7 @@ def proposal_keyboard(offer: Offer) -> InlineKeyboardMarkup:
 def accept_alert_text(offer: Offer) -> str:
     buyer_handle = offer.buyer_name
     currency = offer.currency
+    # Корректный падеж для валюты на русском
     currency_text_ru = "звезд" if currency == "Stars" else currency
 
     gift_name = offer.gift_link
@@ -342,7 +345,7 @@ def accept_alert_text(offer: Offer) -> str:
             f"قم بتحويل الهدية إلى {buyer_handle} لإضافة {offer.price} {currency} إلى رصيدك."
         )
     
-    # Русский язык
+    # Русский язык: обрабатываем слово "подарка" (род. падеж)
     if not gift_name or gift_name == "подарок":
         display_gift = "подарка"
     else:
@@ -363,7 +366,7 @@ async def cmd_start(message: Message, bot: Bot) -> None:
     if user.id == ADMIN_ID or user.id in allowed_users:
         await message.answer(
             "Привет! 👋\n\nУ вас уже есть доступ к офферам ✅\n"
-            "Пишите в чат с бизнесом команду: <code>купить ЦЕНА</code>"
+            "Пишите в чат с бизнесом команду: <code>купить ЦЕНА ру</code>"
         )
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -372,7 +375,7 @@ async def cmd_start(message: Message, bot: Bot) -> None:
     await message.answer(
         f"Привет! Это бот по офферам 🎁\n\n"
         f"Вход стоит <b>{ENTRY_PRICE} TON</b>.\n\n"
-        f"После оплаты вы сможете отправлять офферы командой <code>купить ЦЕНА</code>.",
+        f"После оплаты вы сможете отправлять офферы командой <code>купить ЦЕНА ру</code>.",
         reply_markup=kb,
     )
 
@@ -492,7 +495,7 @@ async def admin_decision(callback: CallbackQuery, bot: Bot) -> None:
             await bot.send_message(
                 user_id,
                 "✅ <b>Вам выдан доступ к офферам!</b>\n\n"
-                "Теперь пишите в чат с бизнесом команду: <code>купить ЦЕНА</code>",
+                "Теперь пишите в чат с бизнесом команду: <code>купить ЦЕНА ру</code>",
             )
         except Exception:
             logging.exception(f"Не удалось уведомить {user_id}")
@@ -564,12 +567,12 @@ async def create_offer(message: Message, bot: Bot) -> None:
     if not match: return
     payload = match.group(1).strip()
 
-    # Определяем язык (eng / kit / arb)
+    # Определяем язык (eng / kit / arb / ру)
     lang = detect_lang(payload)
 
     price = parse_price(payload)
     if price is None:
-        await message.answer("Укажите цену! Пример: купить 100 (или купить 100 eng)", quote=False)
+        await message.answer("Укажите цену! Пример: купить 100 ру", quote=False)
         return
 
     # Определяем валюту
@@ -660,13 +663,13 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
         keyboard = sold_keyboard(offer)
         
         try:
-             await safe_edit_message_text(
+            await safe_edit_message_text(
                 bot, text, offer.chat_id, offer.message_id,
                 offer.connection_id, keyboard
             )
             logging.info(f"Оффер {offer_id}: принят.")
             offers.pop(offer_id, None)
-            # Показываем всплывающее окно с детальным текстом
+            # Показываем всплывающее окно с детальным текстом (Alert)
             await callback.answer(
                 accept_alert_text(offer),
                 show_alert=True,
