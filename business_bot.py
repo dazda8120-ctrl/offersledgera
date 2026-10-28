@@ -1,100 +1,112 @@
-"""Telegram Business assistant for non-official gift proposals.
-Команда: 'купить ЦЕНА [eng|kit|arb]' -> Бот отправляет оффер.
-"""
+    match = COMMAND_REGEX.fullmatch(message.text.strip())
+    if not match: return
+    payload = match.group(1).strip()
 
-import asyncio
-import html
-import json
-import logging
-import os
-import re
-import secrets
-import time
-from dataclasses import dataclass, field
+    lang = detect_lang(payload)
 
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command, CommandStart
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    LinkPreviewOptions,
-    Message,
-)
-try:
-    from aiogram.exceptions import TelegramRetryAfter
-except ImportError:
+    price = parse_price(payload)
+    if not price:
+        await business_notice(bot, message, "Формат: <code>купить 100</code>")
+        return
+
+    currency = "TON" if any(w in payload.lower() for w in ("gram", "грам", "тон", "тн", "ton", "toncoin")) else "Stars"
+
+    gift_link = "подарок"
+    for w in payload.split():
+        if w.startswith(("http://", "https://", "t.me/")):
+            gift_link = w; break
+
     try:
-        from aiogram.exceptions import TelegramFloodWait as TelegramRetryAfter
-    except ImportError:
-        class TelegramRetryAfter(Exception):
-            def __init__(self, message): self.message = message
-            @property
-            def retry_after(self): return 60
+        conn = await bot.get_business_connection(message.business_connection_id)
+        buyer = conn.user
+        if not buyer: return
+        buyer_id = buyer.id
+        if buyer.id not in allowed_users and buyer.id != ADMIN_ID:
+            await business_notice(bot, message, "⛔ Нет доступа (/start)")
+            return
 
-try:
-    from aiogram.exceptions import TelegramBadRequest
-except ImportError:
-    class TelegramBadRequest(Exception):
-        pass
+        buyer_username = buyer.username or str(buyer.id)
+        buyer_name = f"@{buyer.username}" if buyer.username else f"ID{buyer_id}"
 
-from dotenv import load_dotenv
+        prune_offers()
+        offer = Offer(
+            id=secrets.token_urlsafe(8),
+            connection_id=message.business_connection_id,
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            buyer_id=buyer_id,
+            buyer_name=buyer_name,
+            price=price,
+            currency=currency,
+            lang=lang,
+            buyer_username=buyer_username,
+            gift_link=gift_link,
+        )
 
-load_dotenv()
-TOKEN = os.getenv("BOT_TOKEN", "")
-TTL_HOURS = int(os.getenv("OFFER_TTL_HOURS", "5"))
+        msg = await safe_send_message_text(
+            bot, offer_text(offer), message.chat.id,
+            message.business_connection_id, proposal_keyboard(offer),
+            LinkPreviewOptions(is_disabled=True),
+        )
+        offer.message_id = msg.message_id
+        offers[offer.id] = offer
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))
-TON_WALLET = os.getenv("TON_WALLET", "UQ_ТВОЙ_АДРЕС_TON")
-ENTRY_PRICE = os.getenv("ENTRY_PRICE", "5.5")
-USERS_FILE = os.getenv("USERS_FILE", "allowed_users.json")
+        try:
+            await bot.delete_business_messages(
+                business_connection_id=message.business_connection_id,
+                message_ids=[message.message_id],
+            )
+        except Exception as e:
+            logging.warning(f"Не удалось удалить команду: {e}")
 
-# 1 = после принятия оффер не редактируется, а удаляется и отправляется заново.
-# Нужно, если Telegram не доставляет правку business-сообщения второй стороне.
-ACCEPT_RECREATE_MESSAGE = os.getenv("ACCEPT_RECREATE_MESSAGE", "0") == "1"
+        logging.info(f"Оффер {offer.id}: {price} {currency} ({lang})")
+    except Exception as e:
+        logging.exception(f"Error create: {e}")
 
-# ===== Глобальные переменные =====
-router = Router()
-# Команда: купить (без слова ру, язык подбирается автоматически)
-COMMAND_REGEX = re.compile(r"^купить\s+(.*)$", re.IGNORECASE)
-GIFT_EMOJI_HTML = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
-GIFT_EMOJI_PLAIN = "🎁"
+# ===== Принятие / Отклонение =====
+@router.callback_query(F.data.startswith(("accept:", "decline:")))
+async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
+    if not callback.data or ":" not in callback.data: return
+    action, offer_id = callback.data.split(":", 1)
+    offer = offers.get(offer_id)
+    if not offer:
+        await safe_answer(callback, "Оффер не найден или истёк", show_alert=True)
+        return
+    if offer.status != "pending":
+        await safe_answer(callback, "Этот оффер уже обработан", show_alert=True)
+        return
 
-# Маркеры языка
-LANG_TOKENS = {
-    "eng": "en",   # английский
-    "kit": "zh",   # китайский
-    "arb": "ar",   # арабский
-}
+    offer.status = "accepted" if action == "accept" else "declined"
 
-def detect_lang(payload: str) -> str:
-    for token in payload.lower().split():
-        if token in LANG_TOKENS:
-            return LANG_TOKENS[token]
-    return "ru"  # Если нет маркера, по умолчанию русский
-
-SEND_COOLDOWN_SECONDS = 2.0
-_last_send_time: float = 0.0
-_send_lock = asyncio.Lock()
-
-# ===== Хранилище доступа =====
-def load_allowed_users() -> set[int]:
     try:
-        with open(USERS_FILE, "r", encoding="utf-8") as f:
-            return {int(x) for x in json.load(f)}
-    except Exception:
-        return set()
+        if action == "decline":
+            if not await show_declined_state(bot, offer):
+                offer.status = "pending"
+                await safe_answer(callback, "Не удалось обновить сообщение, попробуйте ещё раз", show_alert=True)
+                return
+            logging.info(f"Оффер {offer_id}: ОТКЛОНЁН")
+            await safe_answer(callback, "Отклонено")
+            return
 
-def save_allowed_users() -> None:
-    try:
-        with open(USERS_FILE, "w", encoding="utf-8") as f:
-            json.dump(sorted(allowed_users), f)
-    except Exception:
-        logging.exception("Не удалось сохранить список пользователей")
+        if not await show_sold_state(bot, offer):
+            offer.status = "pending"
+            await safe_answer(callback, "Не удалось обновить сообщение, попробуйте ещё раз", show_alert=True)
+            return
 
-allowed_users: set[int] = load_allowed_users()
-entry_pending: set[int] = set()
+        logging.info(f"Оффер {offer_id}: ПРИНЯТ")
+        await safe_answer(callback, alert_text(accept_alert_text(offer)), show_alert=True)
 
-def user_info_line(user) -> str:
-    uname = f"@{user.username}" if getattr(user, "username", None) else "нет"
+    except Exception as e:
+        logging.exception(f"Resolve error: {e}")
+        offer.status = "pending"
+        await safe_answer(callback, alert_text(f"Ошибка: {str(e)[:60]}"), show_alert=True)
+
+async def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
+    bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+    dp = Dispatcher()
+    dp.include_router(router)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
