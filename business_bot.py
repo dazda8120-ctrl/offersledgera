@@ -49,13 +49,12 @@ router = Router()
 COMMAND_REGEX = re.compile(r"^купить\s+(.*)$", re.IGNORECASE)
 GIFT_EMOJI_HTML = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
 
-# Маркеры языка в конце команды
-# Добавлено "ру" для явного указания русского языка
+# Маркеры языка: Добавлено "ру" для явного указания
 LANG_TOKENS = {
     "eng": "en",   # английский
     "kit": "zh",   # китайский
     "arb": "ar",   # арабский
-    "ру": "ru",    # русский (добавлено)
+    "ру": "ru",    # русский
 }
 
 
@@ -118,6 +117,7 @@ async def send_cooldown() -> None:
         _last_send_time = time.monotonic()
 
 
+# Исправленный Order: fields without default values must come first
 @dataclass
 class Offer:
     id: str
@@ -126,10 +126,10 @@ class Offer:
     message_id: int
     buyer_id: int
     buyer_name: str
-    buyer_username: str = ""
     price: str
     currency: str
     lang: str = "ru"
+    buyer_username: str = ""
     gift_link: str = "подарок"
 
 
@@ -318,7 +318,7 @@ def proposal_keyboard(offer: Offer) -> InlineKeyboardMarkup:
 def accept_alert_text(offer: Offer) -> str:
     buyer_handle = offer.buyer_name
     currency = offer.currency
-    # Корректный падеж для валюты на русском
+    # Корректный перевод для русского языка
     currency_text_ru = "звезд" if currency == "Stars" else currency
 
     gift_name = offer.gift_link
@@ -615,10 +615,10 @@ async def create_offer(message: Message, bot: Bot) -> None:
             message_id=message.message_id,
             buyer_id=buyer_id,
             buyer_name=buyer_name,
-            buyer_username=buyer_username,
             price=price,
             currency=currency,
             lang=lang,
+            buyer_username=buyer_username,
             gift_link=gift_link,
         )
 
