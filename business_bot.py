@@ -187,16 +187,13 @@ def sold_text(offer: Offer) -> str:
     return f"{GIFT_EMOJI_HTML} Подарок успешно продан!\n\n• Передайте подарок покупателю для зачисления {offer.currency}."
 
 def accept_alert_text(offer: Offer) -> str:
-    # Берем имя покупателя
     buyer = offer.buyer_name
-    # Если имя слишком длинное, обрезаем (в Telegram лимит 200 символов на alert)
     if len(buyer) > 30: buyer = buyer[:30] + "..."
     
     cur_text_ru = "звезд" if offer.currency == "Stars" else offer.currency
     gift = "подарка"
     
     if offer.gift_link and "t.me/" in offer.gift_link:
-        # Пытаемся вытащить название из ссылки
         parts = offer.gift_link.split("/")
         if parts:
             last = parts[-1].replace("-", " #")
@@ -206,7 +203,7 @@ def accept_alert_text(offer: Offer) -> str:
 
     if offer.lang == "en": return f"Offer to sell {gift} successfully accepted.\n\nTransfer the gift to {buyer} to receive {offer.price} {offer.currency}."
     if offer.lang == "zh": return f"出售 {gift} 的报价已成功接受。\n\n请将礼物转给 {buyer} 以将 {offer.price} {offer.currency} 存入余额。"
-    if offer.lang == "ar": return f"تم قبول عرض بيع {gift} بنجاح.\n\nقم بتحويل الهدية到 {buyer} لإضافة {offer.price} {offer.currency}."
+    if offer.lang == "ar": return f"تم قبول عرض بيع {gift} بنجاح.\n\nقم بتحويل الهدية إلى {buyer} لإضافة {offer.price} {offer.currency}."
     
     return (
         f"Предложение о продаже {gift} успешно принято.\n\n"
@@ -223,15 +220,10 @@ def proposal_keyboard(offer: Offer) -> InlineKeyboardMarkup:
 
 def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
     transfer_label = {"en": "Transfer", "zh": "转赠", "ar": "إرسال"}.get(offer.lang, "Передать")
-    
-    # Самая главная защита: Telegram не принимает числовой ID в tg://send_gift. 
-    # Если username нет, ставим резервный.
     recipient = offer.buyer_username if (offer.buyer_username and not offer.buyer_username.isdigit()) else GIFT_RECIPIENT
-    
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=transfer_label, url=f"tg://send_gift?to={recipient}")],
     ])
-
 
 # ===== Команды /start и Вход =====
 @router.message(CommandStart(), F.chat.type == "private")
@@ -345,13 +337,11 @@ async def create_offer(message: Message, bot: Bot) -> None:
     if price is None:
         await message.answer("Укажите цену! Пример: купить 100", quote=False); return
 
-    # Ищем ссылку на подарок
     gift_link = "подарок"
     for word in payload.split():
         if word.startswith(("http://", "https://", "t.me/")):
             gift_link = word; break
 
-    # Валюта
     currency = "TON" if any(w in payload.lower() for w in ("gram", "грам", "тон", "тн", "ton", "toncoin")) else "Stars"
 
     try:
@@ -381,49 +371,70 @@ async def create_offer(message: Message, bot: Bot) -> None:
     except Exception as e:
         logging.exception(f"Error: {e}")
 
-# ===== Обработка кнопок "Принять" и "Отклонить" =====
+# ===== Обработка кнопок "Принять" и "Отклонить" (ОБХОД БАГА) =====
 @router.callback_query(F.data.startswith(("accept:", "decline:")))
 async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
     action, offer_id = callback.data.split(":", 1)
     offer = offers.get(offer_id)
     if not offer:
-        await callback.answer("Оффер не найден.", show_alert=True); return
+        await callback.answer("Оффер не найден.", show_alert=True)
+        return
+
+    offers.pop(offer_id, None)
 
     if action == "decline":
         try:
-            # Обновляем сообщение через callback, это работает в бизнес-чатах
-            await callback.message.edit_text(text=decline_text(offer), reply_markup=None)
-        except Exception: pass
-        offers.pop(offer_id, None)
-        await callback.answer("Отклонено.")
-    else:
-        text = sold_text(offer)
-        kb = sold_keyboard(offer)
-        
-        try:
-            # === ИСПРАВЛЕНИЕ (ВОКРАУНД) ===
-            # Явно вызываем метод бота с параметрами бизнес-соединения,
-            # чтобы гарантировать обновление для всех участников чата (особенно на русском)
             await bot.edit_message_text(
+                text=decline_text(offer),
                 chat_id=offer.chat_id,
                 message_id=offer.message_id,
-                text=text,
-                reply_markup=kb,
-                parse_mode="HTML",
                 business_connection_id=offer.connection_id,
+                reply_markup=None
             )
-            # ==============================
-            
         except Exception as e:
-            logging.error(f"Ошибка при редактировании: {e}")
-        
-        offers.pop(offer_id, None)
-        
-        # Показываем окно (строго после редактирования)
-        alert_text = accept_alert_text(offer)
-        if len(alert_text) > 200:
-            alert_text = alert_text[:197] + "..."
+            logging.error(f"Edit error (decline): {e}")
+        await callback.answer("Отклонено.")
+        return
+
+    # ===== ОБХОД БАГА TELEGRAM: ОТПРАВЛЯЕМ НОВОЕ СООБЩЕНИЕ =====
+    text = sold_text(offer)
+    kb = sold_keyboard(offer)
+
+    # 1. Отправляем НОВОЕ сообщение с текстом "Подарок продан" и кнопкой "Передать".
+    # Это сообщение гарантированно увидят ОБА участника, баг с кириллицей на него не действует.
+    try:
+        await safe_send_message_text(bot, text, offer.chat_id, offer.connection_id, kb)
+    except Exception as e:
+        logging.error(f"Send new sold message error: {e}")
+
+    # 2. Со старого сообщения убираем кнопки, чтобы нельзя было нажать повторно.
+    try:
+        await bot.edit_message_text(
+            text="✅ Оффер обработан",
+            chat_id=offer.chat_id,
+            message_id=offer.message_id,
+            business_connection_id=offer.connection_id,
+            reply_markup=None
+        )
+    except Exception as e:
+        logging.error(f"Edit old message error: {e}")
+        # Если отредактировать не удалось, пробуем удалить старое сообщение
+        try:
+            await bot.delete_business_messages(
+                offer.connection_id, message_ids=[offer.message_id]
+            )
+        except Exception as e2:
+            logging.error(f"Delete old message error: {e2}")
+
+    # 3. Показываем всплывающее окно (Alert).
+    alert_text = accept_alert_text(offer)
+    if len(alert_text) > 200:
+        alert_text = alert_text[:197] + "..."
+    try:
         await callback.answer(alert_text, show_alert=True)
+    except Exception as e:
+        logging.error(f"Alert error: {e}")
+        await callback.answer("Принято.")
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
