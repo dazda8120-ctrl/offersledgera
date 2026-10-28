@@ -45,7 +45,6 @@ TON_WALLET = os.getenv("TON_WALLET", "UQ_ТВОЙ_АДРЕС_TON")
 ENTRY_PRICE = os.getenv("ENTRY_PRICE", "5.5")
 USERS_FILE = os.getenv("USERS_FILE", "allowed_users.json")
 
-# ===== Глобальные переменные =====
 router = Router()
 COMMAND_REGEX = re.compile(r"^купить\s+(.*)$", re.IGNORECASE)
 GIFT_EMOJI_HTML = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
@@ -65,9 +64,7 @@ def detect_lang(payload: str) -> str:
     return "ru"
 
 
-# ===== Технический cooldown (защита от FLOOD_WAIT) =====
-SEND_COOLDOWN_SECONDS = 1.0
-
+SEND_COOLDOWN_SECONDS = 2.0
 _last_send_time: float = 0.0
 _send_lock = asyncio.Lock()
 
@@ -80,7 +77,6 @@ def load_allowed_users() -> set[int]:
     except Exception:
         return set()
 
-
 def save_allowed_users() -> None:
     try:
         with open(USERS_FILE, "w", encoding="utf-8") as f:
@@ -88,10 +84,8 @@ def save_allowed_users() -> None:
     except Exception:
         logging.exception("Не удалось сохранить список пользователей")
 
-
 allowed_users: set[int] = load_allowed_users()
 entry_pending: set[int] = set()
-
 
 def user_info_line(user) -> str:
     uname = f"@{user.username}" if getattr(user, "username", None) else "нет"
@@ -100,7 +94,6 @@ def user_info_line(user) -> str:
         f"Имя: {html.escape(user.full_name)}\n"
         f"Username: {uname}"
     )
-
 
 def admin_decision_kb(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
@@ -131,17 +124,16 @@ class Offer:
     message_id: int
     buyer_id: int
     buyer_name: str
+    buyer_username: str = ""
     price: str
     currency: str
     lang: str = "ru"
-    buyer_username: str = ""
-    gift_link: str = "подарок"  # Ссылка на подарок
+    gift_link: str = "подарок"
 
 
 offers: dict[str, Offer] = {}
 
 
-# ===== Отправка БЕЗ ретраев на PEER_FLOOD =====
 async def safe_send_message_text(
     bot: Bot, text: str, chat_id: int,
     business_connection_id: str,
@@ -149,59 +141,55 @@ async def safe_send_message_text(
     link_preview_options: LinkPreviewOptions
 ) -> Message:
     await send_cooldown()
-    try:
-        return await bot.send_message(
-            chat_id=chat_id, text=text,
-            business_connection_id=business_connection_id,
-            reply_markup=reply_markup, link_preview_options=link_preview_options
-        )
-    except TelegramRetryAfter as e:
-        if is_peer_flood(e):
+    last_error: Exception = None
+    MAX_PEER_FLOOD_RETRIES = 6
+    for attempt in range(MAX_PEER_FLOOD_RETRIES):
+        try:
+            return await bot.send_message(
+                chat_id=chat_id, text=text,
+                business_connection_id=business_connection_id,
+                reply_markup=reply_markup, link_preview_options=link_preview_options
+            )
+        except TelegramRetryAfter as e:
+            wait_time = e.retry_after if hasattr(e, 'retry_after') else 30
+            logging.info(f"Send Flood Wait ({wait_time}s).")
+            await asyncio.sleep(wait_time)
+        except Exception as e:
+            last_error = e
+            if is_peer_flood(e):
+                wait = 60 * (attempt + 1)
+                logging.error(f"PEER_FLOOD, ждём {wait}с (попытка {attempt+1}/{MAX_PEER_FLOOD_RETRIES})")
+                await asyncio.sleep(wait)
+                continue
             raise
-        wait_time = getattr(e, "retry_after", 30)
-        logging.info(f"FLOOD_WAIT {wait_time}s — один ретрай.")
-        await asyncio.sleep(wait_time)
-        return await bot.send_message(
-            chat_id=chat_id, text=text,
-            business_connection_id=business_connection_id,
-            reply_markup=reply_markup, link_preview_options=link_preview_options
-        )
+    if last_error: raise last_error
 
 
 async def safe_edit_message_text(
     bot: Bot, text: str, chat_id: int, message_id: int,
     business_connection_id: str | None = None,
-    reply_markup: InlineKeyboardMarkup | None = None
+    reply_markup: InlineKeyboardMarkup | None = None,
+    link_preview_options: LinkPreviewOptions | None = None
 ) -> None:
-    if not reply_markup:
-        reply_markup = InlineKeyboardMarkup(inline_keyboard=[])
-    
+    if link_preview_options is None:
+        link_preview_options = LinkPreviewOptions(is_disabled=True)
     max_retries = 3
     for attempt in range(max_retries):
         try:
             await bot.edit_message_text(
-                text=text,
-                chat_id=chat_id,
-                message_id=message_id,
+                text=text, chat_id=chat_id, message_id=message_id,
                 business_connection_id=business_connection_id,
-                reply_markup=reply_markup,
-                parse_mode="HTML"
+                reply_markup=reply_markup, link_preview_options=link_preview_options
             )
-            logging.info(f"💾 Сообщение {message_id} успешно отредактировано.")
             return
         except TelegramRetryAfter as e:
-            if is_peer_flood(e):
-                logging.error(f"PEER_FLOOD при редактировании")
-                raise
-            wait_time = getattr(e, "retry_after", 60)
-            logging.warning(f"FLOOD_WAIT {wait_time}s при редактировании")
-            if attempt == max_retries - 1:
-                raise
+            wait_time = e.retry_after if hasattr(e, 'retry_after') else 60
+            if attempt == max_retries - 1: raise e
+            logging.info(f"Edit Flood Wait ({wait_time}s).")
             await asyncio.sleep(wait_time)
         except Exception as e:
-            if attempt == max_retries - 1:
-                logging.error(f"Ошибка редактирования (попытка {attempt + 1}/{max_retries}): {e}")
-                raise
+            logging.debug(f"Edit failed: {e}")
+            if attempt == max_retries - 1: raise e
             await asyncio.sleep(1)
 
 
@@ -222,34 +210,41 @@ def parse_price(payload: str) -> str | None:
 
 # ===== Многоязычные тексты офферов =====
 def offer_text(offer: Offer) -> str:
-    price = offer.price
-    cur = offer.currency
-    ttl = TTL_HOURS
+    name = html.escape(offer.buyer_name)
+    price, cur, ttl = offer.price, offer.currency, TTL_HOURS
     gift = offer.gift_link
-    nbsp = "\u00A0"
+    
+    # Форматируем имя подарка (улучшаем вид)
+    if "t.me/" in gift or "http" in gift:
+        parts = gift.split("/")
+        if len(parts) > 0:
+            last_part = parts[-1]
+            last_part = last_part.replace("-", " #")
+            gift = re.sub(r'(?<!^)(?=[A-Z])', ' ', last_part).strip()
 
     if offer.lang == "en":
         return (
-            f"User <b>{html.escape(offer.buyer_name)}</b> offers you\n"
-            f"<b>{price} {cur}</b> for {gift}\n\n"
-            f"The offer is valid for another <b>{ttl}h{nbsp}59m.</b>"
+            f"User <b>{name}</b> offers you\n"
+            f"<b>{price} {cur}</b> for <b>{gift}</b>\n\n"
+            f"<b>The offer is valid for another {ttl}h 59m.</b>"
         )
     if offer.lang == "zh":
         return (
-            f"用户 <b>{html.escape(offer.buyer_name)}</b> 向您出价\n"
-            f"<b>{price} {cur}</b> 购买{gift}\n\n"
-            f"报价有效期还剩 <b>{ttl}小时59分钟。</b>"
+            f"用户 <b>{name}</b> 向您出价\n"
+            f"<b>{price} {cur}</b> 购买 <b>{gift}</b>\n\n"
+            f"<b>报价有效期还剩 {ttl}小时59分钟。</b>"
         )
     if offer.lang == "ar":
         return (
-            f"المستخدم <b>{html.escape(offer.buyer_name)}</b> يعرض عليك\n"
-            f"<b>{price} {cur}</b> مقابل {gift}\n\n"
-            f"العرض صالح لمدة <b>{ttl}{nbsp}س{nbsp}و{nbsp}59{nbsp}د أخرى.</b>"
+            f"المستخدم <b>{name}</b> يعرض عليك\n"
+            f"<b>{price} {cur}</b> مقابل <b>{gift}</b>\n\n"
+            f"<b>العرض صالح لمدة {ttl} س و 59 د أخرى.</b>"
         )
+    # Русский (по умолчанию)
     return (
-        f"Пользователь <b>{html.escape(offer.buyer_name)}</b> предлагает\n"
-        f"Вам <b>{price} {cur}</b> за {gift}\n\n"
-        f"Предложение действует ещё <b>{ttl}{nbsp}ч.{nbsp}59{nbsp}м.</b>"
+        f"Пользователь <b>{name}</b> предлагает Вам\n"
+        f"<b>{price} {cur}</b> за <b>{gift}</b>\n\n"
+        f"<b>Предложение действует ещё {ttl}ч 59м.</b>"
     )
 
 
@@ -263,6 +258,12 @@ def decline_text(offer: Offer) -> str:
 
 def sold_text(offer: Offer) -> str:
     cur = offer.currency
+    # Простой перевод валюты для текста сообщения
+    if offer.lang == "ru" and cur == "Stars":
+        cur_display = "звезд"
+    else:
+        cur_display = cur
+
     if offer.lang == "en":
         return (
             f"{GIFT_EMOJI_HTML} The gift has been sold!\n\n"
@@ -280,7 +281,7 @@ def sold_text(offer: Offer) -> str:
         )
     return (
         f"{GIFT_EMOJI_HTML} Подарок успешно продан!\n\n"
-        f"• Передайте подарок покупателю для зачисления {cur}."
+        f"• Передайте подарок покупателю для зачисления {cur_display}."
     )
 
 
@@ -291,8 +292,8 @@ def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
         "ar": "إرسال",
     }.get(offer.lang, "Передать")
     
-    # Кнопка должна вести на того, кто отправил оффер (BUYER)
-    recipient = offer.buyer_username if offer.buyer_username else str(offer.buyer_id)
+    # Используем username если есть, иначе ID
+    recipient = offer.buyer_username if offer.buyer_username else offer.buyer_id
     
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=transfer_label, url=f"tg://send_gift?to={recipient}")],
@@ -305,13 +306,13 @@ def proposal_keyboard(offer: Offer) -> InlineKeyboardMarkup:
         "zh": ("✓ 接受", "✕ 拒绝"),
         "ar": ("✓ قبول", "✕ رفض"),
     }.get(offer.lang, ("✓ Принять", "✕ Отклонить"))
-
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=decline_label, callback_data=f"decline:{offer.id}"),
         InlineKeyboardButton(text=accept_label, callback_data=f"accept:{offer.id}"),
     ]])
 
 
+# ===== Текст для всплывающего окна (Alert) при принятии оффера =====
 def accept_alert_text(offer: Offer) -> str:
     buyer_handle = offer.buyer_name
     currency = offer.currency
@@ -560,42 +561,36 @@ async def create_offer(message: Message, bot: Bot) -> None:
         return
 
     match = COMMAND_REGEX.fullmatch(message.text.strip())
-    if not match:
-        return
+    if not match: return
     payload = match.group(1).strip()
 
+    # Определяем язык (eng / kit / arb)
     lang = detect_lang(payload)
+
     price = parse_price(payload)
     if price is None:
         await message.answer("Укажите цену! Пример: купить 100 (или купить 100 eng)", quote=False)
         return
 
+    # Определяем валюту
+    currency = "TON" if any(
+        word in payload.lower() for word in ("gram", "грам", "тон", "тн", "ton", "toncoin")
+    ) else "Stars"
+
+    # Ищем ссылку на подарок
     gift_link = "подарок"
     for word in payload.split():
         if word.startswith(("http://", "https://", "t.me/")):
             gift_link = word
             break
 
-    payload_lower = payload.lower()
-    if "gram" in payload_lower or "грам" in payload_lower:
-        currency = "gram"
-    elif "ton" in payload_lower or "тон" in payload_lower or "тн" in payload_lower or "toncoin" in payload_lower:
-        currency = "TON"
-    else:
-        currency = "Stars"
-
     try:
-        buyer = message.from_user
-        if not buyer:
-            return
-            
+        connection = await bot.get_business_connection(message.business_connection_id)
+        buyer = connection.user
         buyer_id = buyer.id
         buyer_username = buyer.username if buyer.username else str(buyer.id)
-        buyer_name = (
-            f"@{buyer.username}" if getattr(buyer, "username", None)
-            else (buyer.full_name if hasattr(buyer, "full_name") else f"id{buyer.id}")
-        )
 
+        # Проверка доступа
         if buyer_id != ADMIN_ID and buyer_id not in allowed_users:
             await message.answer(
                 "⛔ У вас нет доступа к офферам.\n"
@@ -603,6 +598,11 @@ async def create_offer(message: Message, bot: Bot) -> None:
                 quote=False,
             )
             return
+
+        buyer_name = (
+            f"@{buyer.username}" if getattr(buyer, "username", None)
+            else (buyer.full_name if hasattr(buyer, "full_name") else f"id{buyer.id}")
+        )
 
         offer_id = secrets.token_urlsafe(8)
         temp_offer = Offer(
@@ -612,10 +612,10 @@ async def create_offer(message: Message, bot: Bot) -> None:
             message_id=message.message_id,
             buyer_id=buyer_id,
             buyer_name=buyer_name,
+            buyer_username=buyer_username,
             price=price,
             currency=currency,
             lang=lang,
-            buyer_username=buyer_username,
             gift_link=gift_link,
         )
 
@@ -627,97 +627,58 @@ async def create_offer(message: Message, bot: Bot) -> None:
             LinkPreviewOptions(is_disabled=True)
         )
         temp_offer.message_id = msg.message_id
+
         offers[offer_id] = temp_offer
 
-        await bot.delete_business_messages(
-            message.business_connection_id, message_ids=[message.message_id]
-        )
+        await bot.delete_business_messages(message.business_connection_id, message_ids=[message.message_id])
         logging.info(f"Оффер {offer_id}: создан (цена {price} {currency}, язык {lang}).")
 
     except Exception as e:
         if is_peer_flood(e):
-            logging.error(f"PEER_FLOOD: {e!r}")
+            logging.error(f"PeerFlood: {e!r}")
         else:
-            logging.exception(f"Error creating offer: {e}")
+            logging.exception(f"Error: {e}")
 
 
-# ===== Принятие / отклонение оффера =====
 @router.callback_query(F.data.startswith(("accept:", "decline:")))
 async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
-    if not callback.data:
-        return
-
     action, offer_id = callback.data.split(":", 1)
     offer = offers.get(offer_id)
     if not offer:
         await callback.answer("Оффер не найден.", show_alert=True)
         return
 
-    # В callback Telegram передаёт ID именно той карточки, по которой продавец
-    # нажал кнопку. Не используем старый сохранённый ID: в Business-чатах он
-    # может отличаться от ID сообщения, доступного в текущем callback.
-    clicked_message = callback.message
-    if not clicked_message:
-        await callback.answer("Сообщение оффера недоступно.", show_alert=True)
-        return
-
-    chat_id = clicked_message.chat.id
-    message_id = clicked_message.message_id
-    business_connection_id = (
-        getattr(callback, "business_connection_id", None)
-        or getattr(clicked_message, "business_connection_id", None)
-        or offer.connection_id
-    )
-
-    logging.info(
-        "Оффер %s: нажал пользователь %s; редактируем chat=%s, message=%s, есть connection=%s",
-        offer_id,
-        callback.from_user.id,
-        chat_id,
-        message_id,
-        bool(business_connection_id),
-    )
-
     if action == "decline":
+        await safe_edit_message_text(
+            bot, decline_text(offer), offer.chat_id, offer.message_id,
+            offer.connection_id, None
+        )
+        offers.pop(offer_id, None)
+        await callback.answer("Отклонено.")
+    else:
+        text = sold_text(offer)
+        keyboard = sold_keyboard(offer)
+        
         try:
-            await safe_edit_message_text(
-                bot=bot,
-                text=decline_text(offer),
-                chat_id=chat_id,
-                message_id=message_id,
-                business_connection_id=business_connection_id,
-                reply_markup=None,
+             await safe_edit_message_text(
+                bot, text, offer.chat_id, offer.message_id,
+                offer.connection_id, keyboard
             )
+            logging.info(f"Оффер {offer_id}: принят.")
             offers.pop(offer_id, None)
-            logging.info(f"Оффер {offer_id}: отклонён.")
-            await callback.answer("Отклонено.")
+            # Показываем всплывающее окно с детальным текстом
+            await callback.answer(
+                accept_alert_text(offer),
+                show_alert=True,
+            )
         except Exception:
-            logging.exception(f"Ошибка отклонения оффера {offer_id}")
+            logging.exception(f"Ошибка принятия оффера {offer_id}")
+            offers.pop(offer_id, None)
             await callback.answer(
                 "Не удалось обновить оффер. Попробуйте ещё раз.",
                 show_alert=True,
             )
-        return
 
-    try:
-        # Редактируем ту же карточку, на которой продавец нажал «Принять».
-        await safe_edit_message_text(
-            bot=bot,
-            text=sold_text(offer),
-            chat_id=chat_id,
-            message_id=message_id,
-            business_connection_id=business_connection_id,
-            reply_markup=sold_keyboard(offer),
-        )
-        offers.pop(offer_id, None)
-        logging.info(f"Оффер {offer_id}: принят.")
-        await callback.answer(accept_alert_text(offer), show_alert=True)
-    except Exception:
-        logging.exception(f"Ошибка принятия оффера {offer_id}")
-        await callback.answer(
-            "Не удалось обновить оффер. Попробуйте ещё раз.",
-            show_alert=True,
-        )
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
@@ -732,4 +693,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
