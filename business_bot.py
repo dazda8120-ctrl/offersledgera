@@ -291,8 +291,8 @@ def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
         "ar": "إرسال",
     }.get(offer.lang, "Передать")
     
-    # ВАЖНО: Кнопка должна вести на того, кто отправил оффер (BUYER)
-    recipient = offer.buyer_username
+    # Кнопка должна вести на того, кто отправил оффер (BUYER)
+    recipient = offer.buyer_username if offer.buyer_username else str(offer.buyer_id)
     
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=transfer_label, url=f"tg://send_gift?to={recipient}")],
@@ -651,30 +651,47 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
         return
 
     if action == "decline":
-        await safe_edit_message_text(
-            bot, decline_text(offer), offer.chat_id, offer.message_id,
-            offer.connection_id, None
-        )
+        try:
+            await safe_edit_message_text(
+                bot, decline_text(offer), offer.chat_id, offer.message_id,
+                offer.connection_id, None
+            )
+            logging.info(f"Оффер {offer_id}: Отклонен.")
+        except Exception:
+            logging.exception(f"Ошибка рефьюза оффера {offer_id}")
         offers.pop(offer_id, None)
         await callback.answer("Отклонено.")
     else:
         text = sold_text(offer)
         keyboard = sold_keyboard(offer)
+        offers.pop(offer_id, None)
         
+        # === ГАРАНТИЯ ОБНОВЛЕНИЯ: Новый метод ===
+        # 1. Создаем новое сообщение, которое привязываем (reply) к старому. Это гарантирует синхронизацию у всех.
         try:
-            # Редактируем сообщение на месте
+            new_msg = await safe_send_message_text(
+                bot, text, offer.chat_id, offer.connection_id, keyboard,
+                LinkPreviewOptions(is_disabled=True)
+            )
+            logging.info(f"Оффер {offer_id}: Создано сообщение о продаже ID {new_msg.message_id}.")
+            
+            # 2. Ждем полсекунды, чтобы Telegram обновил поток у обоих участников.
+            await asyncio.sleep(0.5)
+            
+            # 3. Удаляем старое сообщение с кнопками "Принять/Отклонить"
+            await bot.delete_business_messages(
+                offer.connection_id, message_ids=[offer.message_id]
+            )
+            logging.info(f"Оффер {offer_id}: Старое сообщение удалено.")
+        except Exception as e:
+            logging.error(f"Ошибка при завершении продажи {offer_id}: {e}")
+            # Если что-то пошло не так, пробуем просто отредактировать на всякий случай
             await safe_edit_message_text(
                 bot, text, offer.chat_id, offer.message_id,
                 offer.connection_id, keyboard
             )
-        except Exception as e:
-            logging.error(f"Не удалось отредактировать оффер {offer_id}: {e}")
-            offers.pop(offer_id, None)
-            return
 
-        offers.pop(offer_id, None)
-        
-        # Показываем всплывающее окно (Alert) на устройстве продавца
+        # 4. Показываем всплывающее окно (Alert) на устройстве продавца
         await callback.answer(accept_alert_text(offer), show_alert=True)
 
 
