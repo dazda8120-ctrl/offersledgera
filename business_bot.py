@@ -1,6 +1,6 @@
-"""
-Telegram Business assistant for non-official gift proposals.
-Команда: 'купить ЦЕНА [ссылка] [ru|eng|kit|arb]' -> Язык в конце обязательный.
+"""Telegram Business assistant for non-official gift proposals.
+Команда: 'купить ЦЕНА [ссылка] [eng|kit|arb|ru]' -> Бот отправляет оффер.
+Плюс: система входа (ENTRY_PRICE TON), заявки админу, доступ только у одобренных.
 """
 
 import asyncio
@@ -12,7 +12,6 @@ import re
 import secrets
 import time
 from dataclasses import dataclass
-from typing import Dict
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -36,20 +35,27 @@ TON_WALLET = os.getenv("TON_WALLET", "UQ_ТВОЙ_АДРЕС_TON")
 ENTRY_PRICE = os.getenv("ENTRY_PRICE", "5.5")
 USERS_FILE = os.getenv("USERS_FILE", "allowed_users.json")
 
-# Резервный получатель для подарков
+# Резервный получатель для подарков, если у покупателя нет @username
 GIFT_RECIPIENT = "mindly_offer" 
 
 router = Router()
 COMMAND_REGEX = re.compile(r"^купить\s+(.*)$", re.IGNORECASE)
 GIFT_EMOJI_HTML = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
 
-# Точное сопоставление команд с внутренними кодами
-SUPPORTED_LANGS: Dict[str, str] = {
-    "ru": "ru",
+# 1. Добавлен "ru"
+LANG_TOKENS = {
     "eng": "en",
     "kit": "zh",
     "arb": "ar",
+    "ru": "ru",
 }
+
+# 2. Теперь возвращает None, если язык не указан
+def detect_lang(payload: str) -> str | None:
+    for token in payload.lower().split():
+        if token in LANG_TOKENS:
+            return LANG_TOKENS[token]
+    return None
 
 # ===== Технический cooldown =====
 SEND_COOLDOWN_SECONDS = 1.0
@@ -65,7 +71,7 @@ async def send_cooldown() -> None:
             await asyncio.sleep(SEND_COOLDOWN_SECONDS - elapsed)
         _last_send_time = time.monotonic()
 
-# ===== Хранилище доступа =====
+# ===== Хранилище доступа и заявок =====
 def load_allowed_users() -> set[int]:
     try:
         with open(USERS_FILE, "r", encoding="utf-8") as f:
@@ -116,7 +122,7 @@ class Offer:
 
 offers: dict[str, Offer] = {}
 
-# ===== Безопасная отправка =====
+# ===== Безопасная отправка сообщений =====
 async def safe_send_message_text(
     bot: Bot, text: str, chat_id: int,
     business_connection_id: str,
@@ -141,7 +147,8 @@ async def safe_send_message_text(
             link_preview_options=LinkPreviewOptions(is_disabled=True)
         )
 
-def parse_price(parts: list[str]) -> str | None:
+def parse_price(payload: str) -> str | None:
+    parts = payload.split()
     for part in parts:
         try:
             raw = part.replace(",", ".").lower()
@@ -163,7 +170,7 @@ def offer_text(offer: Offer) -> str:
     if offer.lang == "en":
         return f"User <b>{name}</b> offers you\n<b>{offer.price} {offer.currency}</b> for {gift}\n\n<b>The offer is valid for another {TTL_HOURS}h{nbsp}59m.</b>"
     if offer.lang == "zh":
-        return f"用户 <b>{name}</b> 向您出价\n<b>{offer.price} {offer.currency}</b> 购买{gift}\n\n<b>报价有效期还剩 {TTL_HOURS}小时 59分钟。</b>"
+        return f"用户 <b>{name}</b> 向您出价\n<b>{offer.price} {offer.currency}</b> 购买{gift}\n\n<b>报价有效期还剩 {TTL_HOURS}小时59分钟。</b>"
     if offer.lang == "ar":
         return f"المستخدم <b>{name}</b> يعرض عليك\n<b>{offer.price} {offer.currency}</b> مقابل {gift}\n\n<b>العرض صالح لمدة {TTL_HOURS}{nbsp}س{nbsp}و{nbsp}59{nbsp}د أخرى.</b>"
     
@@ -174,19 +181,20 @@ def offer_text(offer: Offer) -> str:
     )
 
 def decline_text(offer: Offer) -> str:
-    return {"en": "❌ Offer declined", "zh": "❌ 报价已被拒绝", "ar": "❌ تم رفض العرض", "ru": "❌ Предложение отклонено"}.get(offer.lang, "❌ Предложение отклонено")
+    return {"en": "❌ Offer declined", "zh": "❌ 报价已被拒绝", "ar": "❌ تم رفض العرض"}.get(offer.lang, "❌ Предложение отклонено")
 
 def sold_text(offer: Offer) -> str:
-    lang_map = {
-        "en": f"{GIFT_EMOJI_HTML} The gift has been sold!\n\n• Transfer the gift to the buyer to credit {offer.currency}.",
-        "zh": f"{GIFT_EMOJI_HTML} 礼物已成功售出！\n\n• 请将礼物转给买家以入账 {offer.currency}。",
-        "ar": f"{GIFT_EMOJI_HTML} تم بيع الهدية بنجاح!\n\n• قم بتحويل الهدية للمشتري ليتم إضافة {offer.currency}."
-    }
-    return lang_map.get(offer.lang, f"{GIFT_EMOJI_HTML} Подарок успешно продан!\n\n• Передайте подарок покупателю для зачисления {offer.currency}.")
+    if offer.lang == "en": return f"{GIFT_EMOJI_HTML} The gift has been sold!\n\n• Transfer the gift to the buyer to credit {offer.currency}."
+    if offer.lang == "zh": return f"{GIFT_EMOJI_HTML} 礼物已成功售出！\n\n• 请将礼物转给买家以入账 {offer.currency}。"
+    if offer.lang == "ar": return f"{GIFT_EMOJI_HTML} تم بيع الهدية بنجاح!\n\n• قم بتحويل الهدية للمشتري ليتم إضافة {offer.currency}."
+    return f"{GIFT_EMOJI_HTML} Подарок успешно продан!\n\n• Передайте подарок покупателю для зачисления {offer.currency}."
 
 def accept_alert_text(offer: Offer) -> str:
     buyer = offer.buyer_name
     if len(buyer) > 30: buyer = buyer[:30] + "..."
+    
+    cur_text_ru = "звезд" if offer.currency == "Stars" else offer.currency
+    gift = "подарка"
     
     if offer.gift_link and "t.me/" in offer.gift_link:
         parts = offer.gift_link.split("/")
@@ -195,19 +203,10 @@ def accept_alert_text(offer: Offer) -> str:
             gift = re.sub(r'(?<!^)(?=[A-Z])', ' ', last).strip()
     elif offer.gift_link != "подарок":
         gift = offer.gift_link
-    else:
-        gift = "подарка"
 
-    cur_text_ru = "звезд" if offer.currency == "Stars" else offer.currency
-    
-    lang_map = {
-        "en": f"Offer to sell {gift} successfully accepted.\n\nTransfer the gift to {buyer} to receive {offer.price} {offer.currency}.",
-        "zh": f"出售 {gift} 的报价已成功接受。\n\n请将礼物转给 {buyer} 以将 {offer.price} {offer.currency} 存入余额。",
-        "ar": f"تم قبول عرض بيع {gift} بنجاح。\n\n قم بتحويل الهدية إلى {buyer} لإضافة {offer.price} {offer.currency}."
-    }
-    
-    if offer.lang in lang_map:
-        return lang_map[offer.lang]
+    if offer.lang == "en": return f"Offer to sell {gift} successfully accepted.\n\nTransfer the gift to {buyer} to receive {offer.price} {offer.currency}."
+    if offer.lang == "zh": return f"出售 {gift} 的报价已成功接受。\n\n请将礼物转给 {buyer} 以将 {offer.price} {offer.currency} 存入余额。"
+    if offer.lang == "ar": return f"تم قبول عرض بيع {gift} بنجاح.\n\nقم بتحويل الهدية إلى {buyer} لإضافة {offer.price} {offer.currency}."
     
     return (
         f"Предложение о продаже {gift} успешно принято.\n\n"
@@ -216,20 +215,15 @@ def accept_alert_text(offer: Offer) -> str:
 
 # ===== Клавиатуры =====
 def proposal_keyboard(offer: Offer) -> InlineKeyboardMarkup:
-    labels = {
-        "en": ("Accept", "Decline"),
-        "zh": ("✓ 接受", "✕ 拒绝"),
-        "ar": ("✓ قبول", "✕ رفض"),
-        "ru": ("✓ Принять", "✕ Отклонить")
-    }
-    accept_label, decline_label = labels.get(offer.lang, labels["ru"])
+    accept_label, decline_label = {"en": ("✓ Accept", "✕ Decline"), "zh": ("✓ 接受", "✕ 拒绝"), "ar": ("✓ قبول", "✕ رفض")}.get(offer.lang, ("✓ Принять", "✕ Отклонить"))
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=decline_label, callback_data=f"decline:{offer.id}"),
         InlineKeyboardButton(text=accept_label, callback_data=f"accept:{offer.id}"),
     ]])
 
 def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
-    transfer_label = {"en": "Transfer", "zh": "转赠", "ar": "إرسال", "ru": "Передать"}.get(offer.lang, "Передать")
+    transfer_label = {"en": "Transfer", "zh": "转赠", "ar": "إرسال"}.get(offer.lang, "Передать")
+    # Главная защита: если username нет, ставим резервный.
     recipient = offer.buyer_username if (offer.buyer_username and not offer.buyer_username.isdigit()) else GIFT_RECIPIENT
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=transfer_label, url=f"tg://send_gift?to={recipient}")],
@@ -241,12 +235,8 @@ async def cmd_start(message: Message, bot: Bot) -> None:
     user = message.from_user
     if not user: return
     if user.id == ADMIN_ID or user.id in allowed_users:
-        await message.answer(
-            "Привет! 👋\n\nУ вас уже есть доступ к офферам ✅\n"
-            "Пишите в чат с бизнесом команду: <code>купить ЦЕНА [ссылка] ЯЗЫК</code>\n"
-            "<i>Пример: купить 100 ru</i>", 
-            parse_mode="HTML"
-        )
+        # 3. Обновил подсказку, чтобы юзер знал про обязательный ru
+        await message.answer("Привет! 👋\n\nУ вас уже есть доступ к офферам ✅\nПишите в чат с бизнесом команду: <code>купить ЦЕНА ru</code> (или eng, kit, arb)")
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔑 Купить вход", callback_data="entry:start")]])
     await message.answer(f"Привет! Это бот по офферам 🎁\n\nВход стоит <b>{ENTRY_PRICE} TON</b>.", reply_markup=kb)
@@ -347,37 +337,26 @@ async def create_offer(message: Message, bot: Bot) -> None:
     if not match: return
     
     payload = match.group(1).strip()
-    parts = payload.split()
-    if not parts:
-        await message.answer("Укажите цену и язык! Пример: купить 100 ru", quote=False)
-        return
-
-    # Строгая проверка: последнее слово это язык
-    last_part = parts[-1].lower()
-    if last_part not in SUPPORTED_LANGS:
+    lang = detect_lang(payload)
+    
+    # 4. Жесткая проверка: если языка нет - выдаем ошибку и не создаем оффер
+    if not lang:
         await message.answer(
-            f"❌ Неверный формат.\nИспользуйте: <code>купить ЦЕНА [ссылка] ЯЗЫК</code>\n"
-            f"Доступные языки: <code>ru, eng, kit, arb</code>.",
-            quote=False,
-            parse_mode="HTML"
+            "❌ Укажите язык в конце команды!\nПример: <code>купить 100 ru</code> (или eng, kit, arb)",
+            quote=False
         )
         return
 
-    offer_lang = SUPPORTED_LANGS[last_part]
-    content_parts = parts[:-1]
-
-    price = parse_price(content_parts)
+    price = parse_price(payload)
     if price is None:
-        await message.answer("❌ Не удалось определить цену.", quote=False)
-        return
+        await message.answer("Укажите цену! Пример: <code>купить 100 ru</code>", quote=False); return
 
     gift_link = "подарок"
-    for word in content_parts:
+    for word in payload.split():
         if word.startswith(("http://", "https://", "t.me/")):
-            gift_link = word
-            break
+            gift_link = word; break
 
-    currency = "TON" if any(w in (content_parts) for w in ("gram", "грам", "тон", "тн", "ton", "toncoin")) else "Stars"
+    currency = "TON" if any(w in payload.lower() for w in ("gram", "грам", "тон", "тн", "ton", "toncoin")) else "Stars"
 
     try:
         connection = await bot.get_business_connection(message.business_connection_id)
@@ -385,8 +364,7 @@ async def create_offer(message: Message, bot: Bot) -> None:
         buyer_id = buyer.id
 
         if buyer_id != ADMIN_ID and buyer_id not in allowed_users:
-            await message.answer("⛔ Нет доступа. Нажмите /start в личке бота.", quote=False)
-            return
+            await message.answer("⛔ Нет доступа. Нажмите /start в личке бота.", quote=False); return
 
         buyer_name = f"@{buyer.username}" if getattr(buyer, "username", None) else (buyer.full_name if hasattr(buyer, "full_name") else f"id{buyer.id}")
         buyer_username = buyer.username if buyer.username else str(buyer.id)
@@ -396,7 +374,7 @@ async def create_offer(message: Message, bot: Bot) -> None:
             id=offer_id, connection_id=message.business_connection_id,
             chat_id=message.chat.id, message_id=message.message_id,
             buyer_id=buyer_id, buyer_name=buyer_name, buyer_username=buyer_username,
-            price=price, currency=currency, lang=offer_lang, gift_link=gift_link
+            price=price, currency=currency, lang=lang, gift_link=gift_link
         )
 
         msg = await safe_send_message_text(bot, offer_text(temp_offer), message.chat.id, message.business_connection_id, proposal_keyboard(temp_offer))
@@ -406,16 +384,14 @@ async def create_offer(message: Message, bot: Bot) -> None:
         await bot.delete_business_messages(message.business_connection_id, message_ids=[message.message_id])
     except Exception as e:
         logging.exception(f"Error: {e}")
-        await message.answer(f"Ошибка обработки: {e}", quote=False)
 
-# ===== Обработка кнопок =====
+# ===== Обработка кнопок "Принять" и "Отклонить" =====
 @router.callback_query(F.data.startswith(("accept:", "decline:")))
 async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
     action, offer_id = callback.data.split(":", 1)
     offer = offers.get(offer_id)
     if not offer:
-        await callback.answer("Оффер не найден.", show_alert=True)
-        return
+        await callback.answer("Оффер не найден.", show_alert=True); return
 
     if action == "decline":
         try:
@@ -435,6 +411,7 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
         kb = sold_keyboard(offer)
         
         try:
+            # ВАЖНО: используем bot.edit_message_text с business_connection_id для обновления у продавца
             await bot.edit_message_text(
                 text=text,
                 chat_id=offer.chat_id,
@@ -444,6 +421,7 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
             )
         except Exception as e:
             logging.error(f"Ошибка при редактировании (принятие): {e}")
+            # Если редактирование не удалось, отправляем новое сообщение
             try:
                 await safe_send_message_text(
                     bot, text, offer.chat_id, offer.connection_id, kb
@@ -453,6 +431,7 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
         
         offers.pop(offer_id, None)
         
+        # Показываем окно
         alert_text = accept_alert_text(offer)
         if len(alert_text) > 200:
             alert_text = alert_text[:197] + "..."
