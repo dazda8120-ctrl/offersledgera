@@ -44,11 +44,12 @@ TON_WALLET = os.getenv("TON_WALLET", "UQ_ТВОЙ_АДРЕС_TON")
 ENTRY_PRICE = os.getenv("ENTRY_PRICE", "5.5")
 USERS_FILE = os.getenv("USERS_FILE", "allowed_users.json")
 
-# ===== Глобальные переменные =====
 router = Router()
 # Команда: купить (без слова ру, язык подбирается автоматически)
 COMMAND_REGEX = re.compile(r"^купить\s+(.*)$", re.IGNORECASE)
-GIFT_EMOJI_HTML = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
+
+# Обычный эмодзи для надежности при редактировании
+GIFT_EMOJI = "🎁"
 
 # Маркеры языка
 LANG_TOKENS = {
@@ -169,6 +170,7 @@ async def safe_edit_message_text(
     max_retries = 3
     for attempt in range(max_retries):
         try:
+            # Явно прописываем parse_mode для надежности при редактре
             await bot.edit_message_text(
                 text=text, 
                 chat_id=chat_id, 
@@ -215,7 +217,7 @@ def offer_text(offer: Offer) -> str:
             last_part = parts[-1].replace("-", " #")
             gift = re.sub(r'(?<!^)(?=[A-Z])', ' ', last_part).strip()
     
-    # В самом оффере используем "Звезд" для русского языка
+    # В самом оффере для красоты переводим Stars в "Звезд"
     cur_disp = "Звезд" if offer.lang == "ru" and cur == "Stars" else cur
 
     if offer.lang == "en":
@@ -235,21 +237,20 @@ def decline_text(offer: Offer) -> str:
         "ar": "❌ مرفوض",
     }.get(offer.lang, "❌ Отклонено")
 
-# === ТЕКСТ СООБЩЕНИЯ "ПРОДАНО" (как на скриншоте) ===
+# === ИСПРАВЛЕН ТЕКСТ "ПРОДАНО" (Точно как на скриншоте, с эмодзи без HTML) ===
 def sold_text(offer: Offer) -> str:
     cur = offer.currency
-    # Оставляем "Stars" (или TON)
-    cur_disp = cur 
-
-    if offer.lang == "en":
-        return f"{GIFT_EMOJI_HTML} Sold!\n\n• Transfer to buyer for {cur}."
-    if offer.lang == "zh":
-        return f"{GIFT_EMOJI_HTML} 已售！\n\n• 转给买家入帐 {cur}。"
-    if offer.lang == "ar":
-        return f"{GIFT_EMOJI_HTML} تم البيع!\n\n• إرسال للمشتري {cur}."
+    # НЕ переводим Stars в "звезд" в этом тексте, пишем Stars/TON как на скрине
     
-    # Русский (точно как на скриншоте)
-    return f"{GIFT_EMOJI_HTML} Подарок успешно продан!\n\n• Передайте подарок покупателю для зачисления {cur_disp}."
+    if offer.lang == "en":
+        return f"{GIFT_EMOJI} Sold!\n\n• Transfer to buyer for {cur}."
+    if offer.lang == "zh":
+        return f"{GIFT_EMOJI} 已售！\n\n• 转给买家入帐 {cur}。"
+    if offer.lang == "ar":
+        return f"{GIFT_EMOJI} تم البيع!\n\n• إرسال للمشتري {cur}."
+    
+    # Русский (точь-в-точь как на скриншоте)
+    return f"{GIFT_EMOJI} Подарок успешно продан!\n\n• Передайте подарок покупателю для зачисления {cur}."
 
 def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
     t_label = {"en": "Transfer", "zh": "Trans", "ar": "Send"}.get(offer.lang, "Передать")
@@ -268,11 +269,6 @@ def proposal_keyboard(offer: Offer) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text=dec, callback_data=f"decline:{offer.id}"),
         InlineKeyboardButton(text=acc, callback_data=f"accept:{offer.id}"),
     ]])
-
-# === УБРАЛ OKNO (Алерт) ===
-# Просто ответ для callback (костыль, чтобы не было ошибки, если окно не нужно)
-def accept_alert_text(offer: Offer) -> str:
-    return "Принято." 
 
 
 # ===== /start =====
@@ -427,7 +423,7 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
             text = sold_text(offer)
             kb = sold_keyboard(offer)
             
-            # Просто редактируем сообщение
+            # Редактируем сообщение
             await safe_edit_message_text(
                 bot, text, offer.chat_id, offer.message_id, 
                 offer.connection_id, kb, 
@@ -435,9 +431,9 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
             )
             
             offers.pop(offer_id, None)
-            logging.info(f"Оффер {offer_id}: ПРИНЯТ")
+            logging.info(f"Оффер {offer_id}: ПРИНЯТ. Текст обновлен.")
             
-            # Без всплывающего окна
+            # Ответ в ленте (без всплывашки)
             await callback.answer("Принято")
 
     except Exception as e:
