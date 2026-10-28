@@ -187,16 +187,20 @@ async def safe_edit_message_text(
                 reply_markup=reply_markup,
                 parse_mode="HTML"
             )
+            logging.info(f"💾 Сообщение {message_id} успешно отредактировано.")
             return
         except TelegramRetryAfter as e:
             if is_peer_flood(e):
+                logging.error(f"PEER_FLOOD при редактировании")
                 raise
             wait_time = getattr(e, "retry_after", 60)
+            logging.warning(f"FLOOD_WAIT {wait_time}s при редактировании")
             if attempt == max_retries - 1:
                 raise
             await asyncio.sleep(wait_time)
         except Exception as e:
             if attempt == max_retries - 1:
+                logging.error(f"Ошибка редактирования (попытка {attempt + 1}/{max_retries}): {e}")
                 raise
             await asyncio.sleep(1)
 
@@ -214,6 +218,7 @@ def parse_price(payload: str) -> str | None:
         except ValueError:
             pass
     return None
+
 
 # ===== Многоязычные тексты офферов =====
 def offer_text(offer: Offer) -> str:
@@ -255,6 +260,7 @@ def decline_text(offer: Offer) -> str:
         "ar": "❌ تم رفض العرض",
     }.get(offer.lang, "❌ Предложение отклонено")
 
+
 def sold_text(offer: Offer) -> str:
     cur = offer.currency
     if offer.lang == "en":
@@ -277,6 +283,7 @@ def sold_text(offer: Offer) -> str:
         f"• Передайте подарок покупателю для зачисления {cur}."
     )
 
+
 def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
     transfer_label = {
         "en": "Transfer",
@@ -291,6 +298,7 @@ def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=transfer_label, url=f"tg://send_gift?to={recipient}")],
     ])
 
+
 def proposal_keyboard(offer: Offer) -> InlineKeyboardMarkup:
     accept_label, decline_label = {
         "en": ("✓ Accept", "✕ Decline"),
@@ -302,6 +310,7 @@ def proposal_keyboard(offer: Offer) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text=decline_label, callback_data=f"decline:{offer.id}"),
         InlineKeyboardButton(text=accept_label, callback_data=f"accept:{offer.id}"),
     ]])
+
 
 def accept_alert_text(offer: Offer) -> str:
     buyer_handle = offer.buyer_name
@@ -570,7 +579,7 @@ async def create_offer(message: Message, bot: Bot) -> None:
     payload_lower = payload.lower()
     if "gram" in payload_lower or "грам" in payload_lower:
         currency = "gram"
-    elif "ton" in payload_lower or "тон" в payload_lower or "тн" in payload_lower or "toncoin" in payload_lower:
+    elif "ton" in payload_lower or "тон" in payload_lower or "тн" in payload_lower or "toncoin" in payload_lower:
         currency = "TON"
     else:
         currency = "Stars"
@@ -640,14 +649,12 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
 
     action, offer_id = callback.data.split(":", 1)
     offer = offers.get(offer_id)
-
     if not offer:
         await callback.answer("Оффер не найден.", show_alert=True)
         return
 
     if action == "decline":
         try:
-            # Меняем исходную карточку оффера у обоих участников.
             await safe_edit_message_text(
                 bot=bot,
                 text=decline_text(offer),
@@ -667,34 +674,25 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
             )
         return
 
-    # Принятие: редактируем исходное сообщение, а не создаём новое.
-    text = sold_text(offer)
-    keyboard = sold_keyboard(offer)
-
     try:
+        # Редактируем ту же карточку, на которой продавец нажал «Принять».
         await safe_edit_message_text(
             bot=bot,
-            text=text,
+            text=sold_text(offer),
             chat_id=offer.chat_id,
             message_id=offer.message_id,
             business_connection_id=offer.connection_id,
-            reply_markup=keyboard,
+            reply_markup=sold_keyboard(offer),
         )
-
         offers.pop(offer_id, None)
         logging.info(f"Оффер {offer_id}: принят.")
-
-        await callback.answer(
-            accept_alert_text(offer),
-            show_alert=True,
-        )
+        await callback.answer(accept_alert_text(offer), show_alert=True)
     except Exception:
         logging.exception(f"Ошибка принятия оффера {offer_id}")
         await callback.answer(
             "Не удалось обновить оффер. Попробуйте ещё раз.",
             show_alert=True,
         )
-
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
@@ -709,3 +707,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
