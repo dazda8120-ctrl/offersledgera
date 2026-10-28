@@ -44,12 +44,14 @@ GIFT_EMOJI_HTML = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
 
 LANG_TOKENS = {
     "ru": "ru",
+    "rus": "ru",
     "eng": "en",
     "kit": "zh",
     "arb": "ar",
 }
 
 def detect_lang(payload: str) -> str:
+    # Язык задаётся явным токеном в команде, включая русский.
     for token in payload.lower().split():
         if token in LANG_TOKENS:
             return LANG_TOKENS[token]
@@ -374,6 +376,19 @@ async def create_offer(message: Message, bot: Bot) -> None:
         logging.exception(f"Error: {e}")
 
 # ===== Обработка кнопок "Принять" и "Отклонить" =====
+async def update_offer_in_business_chat(
+    bot: Bot, offer: Offer, text: str, keyboard: InlineKeyboardMarkup
+) -> None:
+    # Редактируем именно исходное сообщение бизнес-чата, передавая ID подключения.
+    await bot.edit_message_text(
+        text=text,
+        chat_id=offer.chat_id,
+        message_id=offer.message_id,
+        business_connection_id=offer.connection_id,
+        reply_markup=keyboard,
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+
 @router.callback_query(F.data.startswith(("accept:", "decline:")))
 async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
     action, offer_id = callback.data.split(":", 1)
@@ -399,14 +414,7 @@ async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
         kb = sold_keyboard(offer)
         
         try:
-            # ВАЖНО: используем bot.edit_message_text с business_connection_id для обновления у продавца
-            await bot.edit_message_text(
-                text=text,
-                chat_id=offer.chat_id,
-                message_id=offer.message_id,
-                business_connection_id=offer.connection_id,
-                reply_markup=kb
-            )
+            await update_offer_in_business_chat(bot, offer, text, kb)
         except Exception as e:
             logging.error(f"Ошибка при редактировании (принятие): {e}")
             # Если редактирование не удалось, отправляем новое сообщение
