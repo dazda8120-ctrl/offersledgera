@@ -1,6 +1,5 @@
-"""Telegram Business assistant for non-official gift proposals.
-Команда: 'купить ЦЕНА [ссылка] [eng|kit|arb]' -> Бот отправляет оффер.
-Плюс: система входа (ENTRY_PRICE TON), заявки админу, доступ только у одобренных.
+"""Telegram Business Gift Offer Bot - Final Edition
+Стабильный, безопасный, с полной обработкой ошибок.
 """
 
 import asyncio
@@ -11,112 +10,108 @@ import os
 import re
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    LinkPreviewOptions,
-    Message,
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+    LinkPreviewOptions, Message, User,
 )
-from aiogram.exceptions import TelegramRetryAfter
 from dotenv import load_dotenv
 
 load_dotenv()
+
 TOKEN = os.getenv("BOT_TOKEN", "")
-TTL_HOURS = int(os.getenv("OFFER_TTL_HOURS", "5"))
-
-ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))
-TON_WALLET = os.getenv("TON_WALLET", "UQ_ТВОЙ_АДРЕС_TON")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+TON_WALLET = os.getenv("TON_WALLET", "")
 ENTRY_PRICE = os.getenv("ENTRY_PRICE", "5.5")
+TTL_HOURS = int(os.getenv("OFFER_TTL_HOURS", "5"))
 USERS_FILE = os.getenv("USERS_FILE", "allowed_users.json")
+OFFERS_LOG = os.getenv("OFFERS_LOG", "offers.log")
+RATE_LIMIT = float(os.getenv("RATE_LIMIT", "1.0"))
 
-# Резервный получатель для подарков, если у покупателя нет @username
-GIFT_RECIPIENT = "mindly_offer" 
+if not TOKEN:
+    raise SystemExit("BOT_TOKEN не задан в .env")
+if not ADMIN_ID:
+    raise SystemExit("ADMIN_ID не задан в .env")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S"
+)
+log = logging.getLogger("giftbot")
 
 router = Router()
-COMMAND_REGEX = re.compile(r"^купить\s+(.*)$", re.IGNORECASE)
-GIFT_EMOJI_HTML = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
+
+COMMAND_REGEX = re.compile(r"^купить\s+(.+)$", re.IGNORECASE | re.DOTALL)
+LINK_REGEX = re.compile(r"(https?://\S+|t\.me/\S+)", re.IGNORECASE)
+PRICE_REGEX = re.compile(r"\b(\d+(?:[.,]\d+)?)\b")
 
 LANG_TOKENS = {
-    "ru": "ru",
-    "rus": "ru",
-    "russian": "ru",
-    "eng": "en",
-    "en": "en",
-    "english": "en",
-    "kit": "zh",
-    "zh": "zh",
-    "chinese": "zh",
-    "arb": "ar",
-    "ar": "ar",
-    "arabic": "ar",
+    "ru": "ru", "рус": "ru",
+    "eng": "en", "en": "en", "англ": "en",
+    "kit": "zh", "zh": "zh", "кит": "zh",
+    "arb": "ar", "ar": "ar", "араб": "ar",
 }
 
 def detect_lang(payload: str) -> str:
-    # Язык задаётся явным токеном в команде. Учитываем пунктуацию рядом с токеном.
-    for token in re.findall(r"[a-zA-Z]+", payload.lower()):
-        if token in LANG_TOKENS:
-            return LANG_TOKENS[token]
+    for word in payload.lower().split():
+        w = word.strip(".,!?")
+        if w in LANG_TOKENS:
+            return LANG_TOKENS[w]
     return "ru"
 
+_rate_lock = asyncio.Lock()
+_last_request: dict[int, float] = {}
 
-def normalize_lang(lang: str) -> str:
-    # Единая нормализация языка для текста оффера и всплывающего окна.
-    return LANG_TOKENS.get((lang or "").lower().strip(), lang if lang in {"ru", "en", "zh", "ar"} else "ru")
-
-# ===== Технический cooldown =====
-SEND_COOLDOWN_SECONDS = 1.0
-_last_send_time: float = 0.0
-_send_lock = asyncio.Lock()
-
-async def send_cooldown() -> None:
-    global _last_send_time
-    async with _send_lock:
+async def rate_limit(user_id: int) -> bool:
+    async with _rate_lock:
         now = time.monotonic()
-        elapsed = now - _last_send_time
-        if elapsed < SEND_COOLDOWN_SECONDS:
-            await asyncio.sleep(SEND_COOLDOWN_SECONDS - elapsed)
-        _last_send_time = time.monotonic()
+        last = _last_request.get(user_id, 0)
+        if now - last < RATE_LIMIT:
+            return False
+        _last_request[user_id] = now
+        return True
 
-# ===== Хранилище доступа и заявок =====
-def load_allowed_users() -> set[int]:
-    try:
-        with open(USERS_FILE, "r", encoding="utf-8") as f:
-            return {int(x) for x in json.load(f)}
-    except Exception:
-        return set()
+_allowed_cache: Optional[set[int]] = None
 
-def save_allowed_users() -> None:
+def load_allowed() -> set[int]:
+    global _allowed_cache
+    if _allowed_cache is None:
+        try:
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                _allowed_cache = {int(x) for x in json.load(f)}
+        except (FileNotFoundError, json.JSONDecodeError):
+            _allowed_cache = set()
+    return _allowed_cache
+
+def save_allowed() -> None:
+    if _allowed_cache is None:
+        return
     try:
         with open(USERS_FILE, "w", encoding="utf-8") as f:
-            json.dump(sorted(allowed_users), f)
-    except Exception:
-        logging.exception("Не удалось сохранить список пользователей")
+            json.dump(sorted(_allowed_cache), f)
+    except Exception as e:
+        log.error(f"save users: {e}")
 
-allowed_users: set[int] = load_allowed_users()
-entry_pending: set[int] = set()
+def is_allowed(user_id: int) -> bool:
+    return user_id == ADMIN_ID or user_id in load_allowed()
 
-def user_info_line(user) -> str:
-    uname = f"@{user.username}" if getattr(user, "username", None) else "нет"
-    return (
-        f"ID: <code>{user.id}</code>\n"
-        f"Имя: {html.escape(user.full_name)}\n"
-        f"Username: {uname}"
-    )
+def grant_access(user_id: int) -> None:
+    load_allowed().add(user_id)
+    save_allowed()
 
-def admin_decision_kb(user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Добавить", callback_data=f"admin:allow:{user_id}"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"admin:deny:{user_id}"),
-    ]])
+def revoke_access(user_id: int) -> None:
+    load_allowed().discard(user_id)
+    save_allowed()
 
-def is_peer_flood(e: Exception) -> bool:
-    return "PEER_FLOOD" in str(e).upper()
 
 @dataclass
 class Offer:
@@ -131,329 +126,606 @@ class Offer:
     currency: str
     lang: str = "ru"
     gift_link: str = "подарок"
+    created_at: float = field(default_factory=time.time)
+    status: str = "pending"
+
 
 offers: dict[str, Offer] = {}
+_pending_users: set[int] = set()
 
-# ===== Безопасная отправка сообщений =====
-async def safe_send_message_text(
-    bot: Bot, text: str, chat_id: int,
-    business_connection_id: str,
-    reply_markup: InlineKeyboardMarkup,
-) -> Message:
-    await send_cooldown()
-    try:
-        return await bot.send_message(
-            chat_id=chat_id, text=text,
-            business_connection_id=business_connection_id,
-            reply_markup=reply_markup, 
-            link_preview_options=LinkPreviewOptions(is_disabled=True)
-        )
-    except TelegramRetryAfter as e:
-        if is_peer_flood(e): raise
-        wait_time = getattr(e, "retry_after", 30)
-        await asyncio.sleep(wait_time)
-        return await bot.send_message(
-            chat_id=chat_id, text=text,
-            business_connection_id=business_connection_id,
-            reply_markup=reply_markup, 
-            link_preview_options=LinkPreviewOptions(is_disabled=True)
-        )
 
-def parse_price(payload: str) -> str | None:
-    parts = payload.split()
-    for part in parts:
-        try:
-            raw = part.replace(",", ".").lower()
-            if raw.replace(".", "").isdigit():
-                price_val = float(raw)
-                if 0 < price_val < 10000000:
-                    formatted = f"{int(price_val) if int(price_val) == price_val else price_val:f}"
-                    return formatted.rstrip('0').rstrip('.')
-        except ValueError:
-            pass
-    return None
+def user_line(user: User) -> str:
+    uname = f"@{user.username}" if user.username else "нет"
+    name = html.escape(user.full_name)
+    return f"ID: <code>{user.id}</code>\nИмя: {name}\nUsername: {uname}"
 
-# ===== Тексты =====
-def offer_text(offer: Offer) -> str:
-    nbsp = "\u00A0"
-    name = html.escape(offer.buyer_name)
-    gift = offer.gift_link if offer.gift_link != "подарок" else "подарок"
-    
-    if offer.lang == "en":
-        return f"User <b>{name}</b> offers you\n<b>{offer.price} {offer.currency}</b> for {gift}\n\n<b>The offer is valid for another {TTL_HOURS}h{nbsp}59m.</b>"
-    if offer.lang == "zh":
-        return f"用户 <b>{name}</b> 向您出价\n<b>{offer.price} {offer.currency}</b> 购买{gift}\n\n<b>报价有效期还剩 {TTL_HOURS}小时59分钟。</b>"
-    if offer.lang == "ar":
-        return f"المستخدم <b>{name}</b> يعرض عليك\n<b>{offer.price} {offer.currency}</b> مقابل {gift}\n\n<b>العرض صالح لمدة {TTL_HOURS}{nbsp}س{nbsp}و{nbsp}59{nbsp}د أخرى.</b>"
-    
-    return (
-        f"Пользователь <b>{name}</b> предлагает\n"
-        f"Вам <b>{offer.price} {offer.currency}</b> за {gift}\n\n"
-        f"Предложение действует ещё <b>{TTL_HOURS}{nbsp}ч.{nbsp}59{nbsp}м.</b>"
-    )
 
-def decline_text(offer: Offer) -> str:
-    return {"en": "❌ Offer declined", "zh": "❌ 报价已被拒绝", "ar": "❌ تم رفض العرض"}.get(offer.lang, "❌ Предложение отклонено")
-
-def sold_text(offer: Offer) -> str:
-    lang = normalize_lang(offer.lang)
-    if lang == "en": return f"{GIFT_EMOJI_HTML} The gift has been sold!\n\n• Transfer the gift to the buyer to credit {offer.currency}."
-    if lang == "zh": return f"{GIFT_EMOJI_HTML} 礼物已成功售出！\n\n• 请将礼物转给买家以入账 {offer.currency}。"
-    if lang == "ar": return f"{GIFT_EMOJI_HTML} تم بيع الهدية بنجاح!\n\n• قم بتحويل الهدية للمشتري ليتم إضافة {offer.currency}."
-    return f"{GIFT_EMOJI_HTML} Подарок успешно продан!\n\n• Передайте подарок покупателю для зачисления {offer.currency}."
-
-def accept_alert_text(offer: Offer) -> str:
-    lang = normalize_lang(offer.lang)
-    buyer = offer.buyer_name
-    if len(buyer) > 30: buyer = buyer[:30] + "..."
-    
-    cur_text_ru = "звезд" if offer.currency == "Stars" else offer.currency
-    gift = "подарка"
-    
-    if offer.gift_link and "t.me/" in offer.gift_link:
-        parts = offer.gift_link.split("/")
-        if parts:
-            last = parts[-1].replace("-", " #")
-            gift = re.sub(r'(?<!^)(?=[A-Z])', ' ', last).strip()
-    elif offer.gift_link != "подарок":
-        gift = offer.gift_link
-
-    if lang == "en": return f"Offer to sell {gift} successfully accepted.\n\nTransfer the gift to {buyer} to receive {offer.price} {offer.currency}."
-    if lang == "zh": return f"出售 {gift} 的报价已成功接受。\n\n请将礼物转给 {buyer} 以将 {offer.price} {offer.currency} 存入余额。"
-    if lang == "ar": return f"تم قبول عرض بيع {gift} بنجاح.\n\nقم بتحويل الهدية إلى {buyer} لإضافة {offer.price} {offer.currency}."
-    
-    return (
-        f"Предложение о продаже {gift} успешно принято.\n\n"
-        f"Передайте подарок {buyer} для зачисления {offer.price} {cur_text_ru} на ваш баланс."
-    )
-
-# ===== Клавиатуры =====
-def proposal_keyboard(offer: Offer) -> InlineKeyboardMarkup:
-    accept_label, decline_label = {"en": ("✓ Accept", "✕ Decline"), "zh": ("✓ 接受", "✕ 拒绝"), "ar": ("✓ قبول", "✕ رفض")}.get(offer.lang, ("✓ Принять", "✕ Отклонить"))
+def admin_kb(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=decline_label, callback_data=f"decline:{offer.id}"),
-        InlineKeyboardButton(text=accept_label, callback_data=f"accept:{offer.id}"),
+        InlineKeyboardButton(text="✅ Добавить", callback_data=f"admin:allow:{user_id}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"admin:deny:{user_id}"),
     ]])
 
-def sold_keyboard(offer: Offer) -> InlineKeyboardMarkup:
-    transfer_label = {"en": "Transfer", "zh": "转赠", "ar": "إرسال"}.get(normalize_lang(offer.lang), "Передать")
-    # Главная защита: если username нет, ставим резервный.
-    recipient = offer.buyer_username if (offer.buyer_username and not offer.buyer_username.isdigit()) else GIFT_RECIPIENT
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=transfer_label, url=f"tg://send_gift?to={recipient}")],
-    ])
 
-# ===== Команды /start и Вход =====
+def log_offer(offer: Offer) -> None:
+    try:
+        with open(OFFERS_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                'id': offer.id,
+                'buyer_id': offer.buyer_id,
+                'buyer_name': offer.buyer_name,
+                'price': offer.price,
+                'currency': offer.currency,
+                'gift_link': offer.gift_link,
+                'status': offer.status,
+                'created': datetime.fromtimestamp(offer.created_at).isoformat(),
+            }, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log.error(f"log_offer: {e}")
+
+
+async def safe_send(bot: Bot, text: str, chat_id: int,
+                    business_connection_id: Optional[str],
+                    kb: Optional[InlineKeyboardMarkup] = None,
+                    retries: int = 3) -> Optional[Message]:
+    for attempt in range(retries):
+        try:
+            kwargs = {
+                'chat_id': chat_id,
+                'text': text,
+                'reply_markup': kb,
+                'link_preview_options': LinkPreviewOptions(is_disabled=True),
+            }
+            if business_connection_id:
+                kwargs['business_connection_id'] = business_connection_id
+            return await bot.send_message(**kwargs)
+        except TelegramRetryAfter as e:
+            wait = min(e.retry_after, 60)
+            log.warning(f"RetryAfter {wait}s")
+            await asyncio.sleep(wait)
+        except TelegramForbiddenError:
+            log.error(f"User {chat_id} blocked bot")
+            return None
+        except TelegramBadRequest as e:
+            log.error(f"BadRequest: {e}")
+            return None
+        except Exception as e:
+            log.exception(f"send {attempt+1}: {e}")
+            await asyncio.sleep(1)
+    return None
+
+
+async def safe_edit(bot: Bot, text: str,
+                    business_connection_id: Optional[str],
+                    message_id: int,
+                    kb: Optional[InlineKeyboardMarkup] = None,
+                    chat_id: Optional[int] = None) -> bool:
+    try:
+        kwargs = {'text': text, 'message_id': message_id, 'reply_markup': kb}
+        if business_connection_id:
+            kwargs['business_connection_id'] = business_connection_id
+        else:
+            kwargs['chat_id'] = chat_id
+        await bot.edit_message_text(**kwargs)
+        return True
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e).lower():
+            return True
+        log.warning(f"edit: {e}")
+        return False
+    except Exception as e:
+        log.error(f"edit: {e}")
+        return False
+
+
+async def safe_delete(bot: Bot, chat_id: int, message_id: int,
+                      business_connection_id: Optional[str] = None) -> bool:
+    try:
+        if business_connection_id:
+            try:
+                await bot.delete_business_messages(
+                    business_connection_id=business_connection_id,
+                    message_ids=[message_id],
+                )
+                return True
+            except Exception:
+                pass
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        return True
+    except Exception as e:
+        log.warning(f"delete: {e}")
+        return False
+
+
+def parse_price(payload: str) -> Optional[str]:
+    cleaned = payload
+    for token in LANG_TOKENS:
+        cleaned = re.sub(rf"\b{token}\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = LINK_REGEX.sub("", cleaned)
+    matches = PRICE_REGEX.findall(cleaned)
+    for m in matches:
+        try:
+            val = float(m.replace(",", "."))
+            if 0 < val < 10_000_000:
+                if val == int(val):
+                    return str(int(val))
+                return f"{val:g}"
+        except ValueError:
+            continue
+    return Nonedef detect_currency(payload: str) -> str:
+    p = payload.lower()
+    for word in ("gram", "грам", "тон", "тн", "ton", "toncoin"):
+        if word in p:
+            return "TON"
+    return "Stars"
+
+
+def detect_gift(payload: str) -> str:
+    m = LINK_REGEX.search(payload)
+    return m.group(0) if m else "подарок"
+
+
+GIFT_EMOJI = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
+
+
+def text_offer(o: Offer) -> str:
+    name = html.escape(o.buyer_name)
+    gift = o.gift_link if o.gift_link != "подарок" else "подарок"
+    ttl = f"{TTL_HOURS}ч 59м"
+    texts = {
+        "en": f"User <b>{name}</b> offers you\n<b>{o.price} {o.currency}</b> for {gift}\n\n<b>Valid for another {ttl}.</b>",
+        "zh": f"用户 <b>{name}</b> 向您出价\n<b>{o.price} {o.currency}</b> 购买{gift}\n\n<b>报价有效期还剩 {ttl}。</b>",
+        "ar": f"المستخدم <b>{name}</b> يعرض عليك\n<b>{o.price} {o.currency}</b> مقابل {gift}\n\n<b>العرض صالح لمدة {ttl} أخرى.</b>",
+        "ru": f"Пользователь <b>{name}</b> предлагает\nВам <b>{o.price} {o.currency}</b> за {gift}\n\nПредложение действует ещё <b>{ttl}.</b>",
+    }
+    return texts.get(o.lang, texts["ru"])
+
+
+def text_declined(o: Offer) -> str:
+    return {"en": "❌ Offer declined", "zh": "❌ 报价已被拒绝", "ar": "❌ تم رفض العرض"}.get(o.lang, "❌ Предложение отклонено")
+
+
+def text_sold(o: Offer) -> str:
+    texts = {
+        "en": f"{GIFT_EMOJI} The gift has been sold!\n\n• Click «Transfer» and send the gift to credit {o.currency}.",
+        "zh": f"{GIFT_EMOJI} 礼物已成功售出！\n\n• 点击「转赠」并发送礼物以入账 {o.currency}。",
+        "ar": f"{GIFT_EMOJI} تم بيع الهدية بنجاح!\n\n• اضغط «إرسال» وأرسل الهدية لإضافة {o.currency}.",
+        "ru": f"{GIFT_EMOJI} Подарок успешно продан!\n\n• Нажмите «Передать» и отправьте подарок для зачисления {o.currency}.",
+    }
+    return texts.get(o.lang, texts["ru"])
+
+
+def text_accept_alert(o: Offer) -> str:
+    buyer = o.buyer_name[:30] + "..." if len(o.buyer_name) > 30 else o.buyer_name
+    if not o.buyer_username or o.buyer_username.isdigit():
+        return f"⚠️ У покупателя нет @username\nОтправьте подарок вручную на ID: {o.buyer_id}"
+    return f"✅ Оффер принят.\nПередайте подарок пользователю {buyer}."
+
+
+def kb_offer(o: Offer) -> InlineKeyboardMarkup:
+    labels = {"en": ("✓ Accept", "✕ Decline"), "zh": ("✓ 接受", "✕ 拒绝"), "ar": ("✓ قبول", "✕ رفض")}.get(o.lang, ("✓ Принять", "✕ Отклонить"))
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=labels[1], callback_data=f"decline:{o.id}"),
+        InlineKeyboardButton(text=labels[0], callback_data=f"accept:{o.id}"),
+    ]])
+
+
+def kb_sold(o: Offer) -> InlineKeyboardMarkup:
+    label = {"en": "Transfer", "zh": "转赠", "ar": "إرسال"}.get(o.lang, "Передать")
+    confirm = {"en": "✓ I sent the gift", "zh": "✓ 我已发送礼物", "ar": "✓ لقد أرسلت الهدية"}.get(o.lang, "✓ Я отправил подарок")
+    buttons = []
+    if o.buyer_username and not o.buyer_username.isdigit():
+        buttons.append([InlineKeyboardButton(text=label, url=f"tg://send_gift?to={o.buyer_username}")])
+    buttons.append([InlineKeyboardButton(text=confirm, callback_data=f"sent:{o.id}")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 @router.message(CommandStart(), F.chat.type == "private")
 async def cmd_start(message: Message, bot: Bot) -> None:
     user = message.from_user
-    if not user: return
-    if user.id == ADMIN_ID or user.id in allowed_users:
-        await message.answer("Привет! 👋\n\nУ вас уже есть доступ к офферам ✅\nПишите в чат с бизнесом команду: <code>купить ЦЕНА</code>")
+    if not user:
         return
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔑 Купить вход", callback_data="entry:start")]])
-    await message.answer(f"Привет! Это бот по офферам 🎁\n\nВход стоит <b>{ENTRY_PRICE} TON</b>.", reply_markup=kb)
+    if is_allowed(user.id):
+        await message.answer(
+            "👋 Привет!\n\n✅ Доступ активен.\n\n"
+            "В чате с бизнесом напишите:\n<code>купить 100</code>\n"
+            "Языки: <code>eng</code>, <code>kit</code>, <code>arb</code>\n"
+            "Валюта: <code>gram</code> (TON) или по умолчанию Stars"
+        )
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔑 Купить вход", callback_data="entry:start")
+    ]])
+    await message.answer(
+        f"👋 Привет! Это бот офферов {GIFT_EMOJI}\n\n"
+        f"Вход стоит <b>{ENTRY_PRICE} TON</b>",
+        reply_markup=kb
+    )
+
 
 @router.callback_query(F.data == "entry:start")
-async def entry_start(callback: CallbackQuery, bot: Bot) -> None:
-    user = callback.from_user
-    if user.id == ADMIN_ID or user.id in allowed_users:
-        await callback.answer("У вас уже есть доступ ✅"); return
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Я оплатил", callback_data="entry:paid")], [InlineKeyboardButton(text="⬅️ Назад", callback_data="entry:back")]])
-    await callback.message.edit_text(f"💳 Оплата входа <b>{ENTRY_PRICE} TON</b>\n\nАдрес: <code>{html.escape(TON_WALLET)}</code>", reply_markup=kb)
-    await callback.answer()
+async def entry_start(cb: CallbackQuery, bot: Bot) -> None:
+    if is_allowed(cb.from_user.id):
+        await cb.answer("✅ Доступ уже есть", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Я оплатил", callback_data="entry:paid")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="entry:back")],
+    ])
+    try:
+        await cb.message.edit_text(
+            f"💳 <b>Оплата входа</b>\n\n"
+            f"Сумма: <b>{ENTRY_PRICE} TON</b>\n"
+            f"Адрес: <code>{html.escape(TON_WALLET)}</code>\n\n"
+            f"После оплаты нажмите «Я оплатил» и пришлите скриншот.",
+            reply_markup=kb
+        )
+    except Exception:
+        pass
+    await cb.answer()
+
 
 @router.callback_query(F.data == "entry:back")
-async def entry_back(callback: CallbackQuery, bot: Bot) -> None:
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔑 Купить вход", callback_data="entry:start")]])
-    await callback.message.edit_text(f"Привет! Это бот по офферам 🎁\n\nВход стоит <b>{ENTRY_PRICE} TON</b>.", reply_markup=kb)
-    await callback.answer()
+async def entry_back(cb: CallbackQuery, bot: Bot) -> None:
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔑 Купить вход", callback_data="entry:start")
+    ]])
+    try:
+        await cb.message.edit_text(
+            f"👋 Привет! Это бот офферов {GIFT_EMOJI}\n\nВход стоит <b>{ENTRY_PRICE} TON</b>",
+            reply_markup=kb
+        )
+    except Exception:
+        pass
+    await cb.answer()
+
 
 @router.callback_query(F.data == "entry:paid")
-async def entry_paid(callback: CallbackQuery, bot: Bot) -> None:
-    user = callback.from_user
-    if user.id == ADMIN_ID or user.id in allowed_users:
-        await callback.answer("У вас уже есть доступ ✅"); return
-    entry_pending.add(user.id)
-    await callback.message.edit_text("📸 Пришлите <b>скриншот перевода</b>.")
+async def entry_paid(cb: CallbackQuery, bot: Bot) -> None:
+    user = cb.from_user
+    if is_allowed(user.id):
+        await cb.answer("✅ Доступ уже есть", show_alert=True)
+        return
+    _pending_users.add(user.id)
     try:
-        await bot.send_message(ADMIN_ID, f"🔔 <b>Заявка на вход</b>\n\n{user_info_line(user)}", reply_markup=admin_decision_kb(user.id))
-    except Exception: pass
-    await callback.answer("Заявка отправлена ✅")
+        await cb.message.edit_text("📸 Пришлите скриншот перевода")
+    except Exception:
+        pass
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"🔔 <b>Заявка на вход</b>\n\n{user_line(user)}",
+            reply_markup=admin_kb(user.id)
+        )
+    except Exception as e:
+        log.error(f"admin notify: {e}")
+    await cb.answer("✅ Заявка отправлена")
 
-@router.message((F.photo | F.document), F.chat.type == "private")
+
+@router.message(F.photo | F.document, F.chat.type == "private")
 async def on_screenshot(message: Message, bot: Bot) -> None:
     user = message.from_user
-    if not user or (user.id != ADMIN_ID and user.id not in entry_pending): return
-    entry_pending.discard(user.id)
+    if not user:
+        return
+    if user.id != ADMIN_ID and user.id not in _pending_users:
+        return
+    _pending_users.discard(user.id)
     try:
-        await message.copy_to(ADMIN_ID, caption=f"📸 <b>Скриншот оплаты</b>\n\n{user_info_line(user)}", reply_markup=admin_decision_kb(user.id))
-        await message.answer("Скриншот отправлен ✅")
-    except Exception: pass
+        await bot.copy_message(
+            chat_id=ADMIN_ID,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+            caption=f"📸 <b>Скриншот оплаты</b>\n\n{user_line(user)}",
+            reply_markup=admin_kb(user.id)
+        )
+        await message.answer("✅ Скриншот отправлен")
+    except Exception as e:
+        log.error(f"screenshot: {e}")
+        await message.answer("⚠️ Не удалось отправить, попробуйте ещё раз")
+
 
 @router.message(Command("ledgerteam"), F.chat.type == "private")
 async def cmd_ledgerteam(message: Message, bot: Bot) -> None:
     user = message.from_user
-    if not user or user.id == ADMIN_ID or user.id in allowed_users: return
+    if not user or is_allowed(user.id):
+        return
     try:
-        await bot.send_message(ADMIN_ID, f"🚀 <b>Заявка /ledgerteam</b>\n\n{user_info_line(user)}", reply_markup=admin_decision_kb(user.id))
-        await message.answer("Заявка отправлена ✅")
-    except Exception: pass
+        await bot.send_message(
+            ADMIN_ID,
+            f"🚀 <b>Заявка /ledgerteam</b>\n\n{user_line(user)}",
+            reply_markup=admin_kb(user.id)
+        )
+        await message.answer("✅ Заявка отправлена")
+    except Exception:
+        pass
 
-# ===== Админка =====
+
 @router.callback_query(F.data.startswith(("admin:allow:", "admin:deny:")))
-async def admin_decision(callback: CallbackQuery, bot: Bot) -> None:
-    if callback.from_user.id != ADMIN_ID: return
-    try: _, action, raw_id = callback.data.split(":"); user_id = int(raw_id)
-    except Exception: return
-    
+async def admin_decision(cb: CallbackQuery, bot: Bot) -> None:
+    if cb.from_user.id != ADMIN_ID:
+        await cb.answer("❌ Нет прав", show_alert=True)
+        return
+    try:
+        _, action, raw = cb.data.split(":", 2)
+        user_id = int(raw)
+    except Exception:
+        await cb.answer("❌ Ошибка", show_alert=True)
+        return
     if action == "allow":
-        allowed_users.add(user_id)
-        save_allowed_users()
-        entry_pending.discard(user_id)
-        try: await bot.send_message(user_id, "✅ <b>Вам выдан доступ!</b>")
-        except Exception: pass
-        if callback.message: await callback.message.edit_text(callback.message.html_text + "\n\n— ✅ <b>Добавлен</b>")
+        grant_access(user_id)
+        _pending_users.discard(user_id)
+        try:
+            await bot.send_message(user_id, "✅ <b>Вам выдан доступ!</b>\n\n/start")
+        except Exception:
+            pass
+        try:
+            await cb.message.edit_text(cb.message.html_text + "\n\n— ✅ <b>Добавлен</b>")except Exception:
+            pass
+        await cb.answer("✅ Добавлен")
     else:
-        entry_pending.discard(user_id)
-        try: await bot.send_message(user_id, "❌ Отклонено.")
-        except Exception: pass
-        if callback.message: await callback.message.edit_text(callback.message.html_text + "\n\n— ❌ <b>Отклонено</b>")
-    await callback.answer("Готово.")
+        _pending_users.discard(user_id)
+        try:
+            await bot.send_message(user_id, "❌ Отклонено.")
+        except Exception:
+            pass
+        try:
+            await cb.message.edit_text(cb.message.html_text + "\n\n— ❌ <b>Отклонено</b>")
+        except Exception:
+            pass
+        await cb.answer("❌ Отклонено")
+
 
 @router.message(Command("grant"), F.chat.type == "private")
 async def cmd_grant(message: Message, bot: Bot) -> None:
-    if message.from_user.id != ADMIN_ID: return
-    try: user_id = int(message.text.split()[1])
-    except Exception: return
-    allowed_users.add(user_id); save_allowed_users()
-    await message.answer(f"✅ Доступ выдан.")
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        user_id = int(message.text.split()[1])
+        grant_access(user_id)
+        await message.answer(f"✅ Доступ выдан: <code>{user_id}</code>")
+        try:
+            await bot.send_message(user_id, "✅ Вам выдан доступ!\n\n/start")
+        except Exception:
+            pass
+    except Exception:
+        await message.answer("❌ Формат: /grant USER_ID")
+
 
 @router.message(Command("revoke"), F.chat.type == "private")
 async def cmd_revoke(message: Message, bot: Bot) -> None:
-    if message.from_user.id != ADMIN_ID: return
-    try: user_id = int(message.text.split()[1])
-    except Exception: return
-    allowed_users.discard(user_id); save_allowed_users()
-    await message.answer(f"🚫 Доступ удалён.")
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        user_id = int(message.text.split()[1])
+        revoke_access(user_id)
+        await message.answer(f"🚫 Доступ удалён: <code>{user_id}</code>")
+    except Exception:
+        await message.answer("❌ Формат: /revoke USER_ID")
+
 
 @router.message(Command("users"), F.chat.type == "private")
 async def cmd_users(message: Message, bot: Bot) -> None:
-    if message.from_user.id != ADMIN_ID: return
-    await message.answer("👥 <b>Список:</b>\n" + "\n".join(f"• <code>{u}</code>" for u in sorted(allowed_users)))
+    if message.from_user.id != ADMIN_ID:
+        return
+    users = sorted(load_allowed())
+    if not users:
+        await message.answer("👥 Список пуст")
+        return
+    await message.answer(
+        f"👥 <b>Пользователей: {len(users)}</b>\n\n" +
+        "\n".join(f"• <code>{u}</code>" for u in users)
+    )
 
-# ===== Создание оффера =====
+
+@router.message(Command("stats"), F.chat.type == "private")
+async def cmd_stats(message: Message, bot: Bot) -> None:
+    if message.from_user.id != ADMIN_ID:
+        return
+    alive = sum(1 for o in offers.values() if o.status == "pending")
+    await message.answer(
+        f"📊 <b>Статистика</b>\n\n"
+        f"Активных офферов: <b>{alive}</b>\n"
+        f"Всего в памяти: <b>{len(offers)}</b>\n"
+        f"Пользователей с доступом: <b>{len(load_allowed())}</b>"
+    )
+
+
 @router.business_message(F.text)
 async def create_offer(message: Message, bot: Bot) -> None:
-    if not message.text or not message.business_connection_id: return
-    match = COMMAND_REGEX.fullmatch(message.text.strip())
-    if not match: return
-    
+    if not message.text or not message.business_connection_id:
+        return
+    match = COMMAND_REGEX.match(message.text.strip())
+    if not match:
+        return
+    uid = message.from_user.id if message.from_user else 0
+    if not await rate_limit(uid):
+        log.warning(f"rate limit: {uid}")
+        return
     payload = match.group(1).strip()
     lang = detect_lang(payload)
     price = parse_price(payload)
     if price is None:
-        await message.answer("Укажите цену! Пример: купить 100", quote=False); return
-
-    gift_link = "подарок"
-    for word in payload.split():
-        if word.startswith(("http://", "https://", "t.me/")):
-            gift_link = word; break
-
-    currency = "TON" if any(w in payload.lower() for w in ("gram", "грам", "тон", "тн", "ton", "toncoin")) else "Stars"
-
+        await safe_send(
+            bot, "⚠️ Укажите цену!\nПример: <code>купить 100</code>",
+            message.chat.id, message.business_connection_id
+        )
+        return
+    gift_link = detect_gift(payload)
+    currency = detect_currency(payload)
     try:
-        connection = await bot.get_business_connection(message.business_connection_id)
+        connection = await bot.get_business_connection(
+            business_connection_id=message.business_connection_id
+        )
         buyer = connection.user
         buyer_id = buyer.id
-
-        if buyer_id != ADMIN_ID and buyer_id not in allowed_users:
-            await message.answer("⛔ Нет доступа. Нажмите /start в личке бота.", quote=False); return
-
-        buyer_name = f"@{buyer.username}" if getattr(buyer, "username", None) else (buyer.full_name if hasattr(buyer, "full_name") else f"id{buyer.id}")
+        if not is_allowed(buyer_id):
+            await safe_send(
+                bot, "⛔️ Нет доступа.\nНажмите /start в личке бота",
+                message.chat.id, message.business_connection_id
+            )
+            return
+        buyer_name = f"@{buyer.username}" if buyer.username else buyer.full_name
         buyer_username = buyer.username if buyer.username else str(buyer.id)
-
         offer_id = secrets.token_urlsafe(8)
-        temp_offer = Offer(
-            id=offer_id, connection_id=message.business_connection_id,
-            chat_id=message.chat.id, message_id=message.message_id,
-            buyer_id=buyer_id, buyer_name=buyer_name, buyer_username=buyer_username,
-            price=price, currency=currency, lang=normalize_lang(lang), gift_link=gift_link
+        offer = Offer(
+            id=offer_id,
+            connection_id=message.business_connection_id,
+            chat_id=message.chat.id,
+                        message_id=message.message_id,
+            buyer_id=buyer_id,
+            buyer_name=buyer_name,
+            buyer_username=buyer_username,
+            price=price,
+            currency=currency,
+            lang=lang,
+            gift_link=gift_link,
         )
-
-        msg = await safe_send_message_text(bot, offer_text(temp_offer), message.chat.id, message.business_connection_id, proposal_keyboard(temp_offer))
-        temp_offer.message_id = msg.message_id
-        offers[offer_id] = temp_offer
-
-        await bot.delete_business_messages(message.business_connection_id, message_ids=[message.message_id])
+        sent = await safe_send(
+            bot, text_offer(offer),
+            message.chat.id, message.business_connection_id,
+            kb_offer(offer)
+        )
+        if not sent:
+            log.error(f"offer send failed {offer_id}")
+            return
+        offer.message_id = sent.message_id
+        offers[offer_id] = offer
+        log_offer(offer)
+        log.info(f"offer: {offer_id} | {price} {currency} | buyer={buyer_id}")
+        await safe_delete(bot, message.chat.id, message.message_id, message.business_connection_id)
     except Exception as e:
-        logging.exception(f"Error: {e}")
+        log.exception(f"create_offer: {e}")
+        try:
+            await safe_send(
+                bot, f"⚠️ Ошибка: {html.escape(str(e)[:100])}",
+                message.chat.id, message.business_connection_id
+            )
+        except Exception:
+            pass
 
-# ===== Обработка кнопок "Принять" и "Отклонить" =====
-async def update_offer_in_business_chat(
-    bot: Bot, offer: Offer, text: str, keyboard: InlineKeyboardMarkup
-) -> None:
-    # Редактируем именно исходное сообщение бизнес-чата, передавая ID подключения.
-    await bot.edit_message_text(
-        text=text,
-        chat_id=offer.chat_id,
-        message_id=offer.message_id,
-        business_connection_id=offer.connection_id,
-        reply_markup=keyboard,
-        link_preview_options=LinkPreviewOptions(is_disabled=True),
-    )
 
 @router.callback_query(F.data.startswith(("accept:", "decline:")))
-async def resolve_offer(callback: CallbackQuery, bot: Bot) -> None:
-    action, offer_id = callback.data.split(":", 1)
+async def resolve_offer(cb: CallbackQuery, bot: Bot) -> None:
+    try:
+        action, offer_id = cb.data.split(":", 1)
+    except Exception:
+        await cb.answer("❌ Ошибка", show_alert=True)
+        return
     offer = offers.get(offer_id)
     if not offer:
-        await callback.answer("Оффер не найден.", show_alert=True); return
-
+        await cb.answer("⚠️ Оффер не найден или истёк", show_alert=True)
+        return
     if action == "decline":
-        try:
-            await bot.edit_message_text(
-                text=decline_text(offer),
-                chat_id=offer.chat_id,
-                message_id=offer.message_id,
-                business_connection_id=offer.connection_id,
-                reply_markup=None
-            )
-        except Exception as e:
-            logging.error(f"Ошибка при отклонении: {e}")
+        offer.status = "declined"
+        log_offer(offer)
+        await safe_edit(
+            bot, text_declined(offer),
+            offer.connection_id, offer.message_id, None, offer.chat_id
+        )
         offers.pop(offer_id, None)
-        await callback.answer("Отклонено.")
+        await cb.answer("❌ Отклонено")
     else:
-        text = sold_text(offer)
-        kb = sold_keyboard(offer)
-        
-        try:
-            await update_offer_in_business_chat(bot, offer, text, kb)
-        except Exception as e:
-            logging.error(f"Ошибка при редактировании (принятие): {e}")
-            # Если редактирование не удалось, отправляем новое сообщение
-            try:
-                await safe_send_message_text(
-                    bot, text, offer.chat_id, offer.connection_id, kb
-                )
-            except Exception as send_e:
-                logging.error(f"Ошибка при отправке нового сообщения: {send_e}")
-        
-        offers.pop(offer_id, None)
-        
-        # Показываем окно
-        alert_text = accept_alert_text(offer)
-        if len(alert_text) > 200:
-            alert_text = alert_text[:197] + "..."
-        await callback.answer(alert_text, show_alert=True)
+        offer.status = "accepted"
+        log_offer(offer)
+        edited = await safe_edit(
+            bot, text_sold(offer),
+            offer.connection_id, offer.message_id,
+            kb_sold(offer), offer.chat_id
+        )
+        if not edited:
+            await safe_send(
+                bot, text_sold(offer),
+                offer.chat_id, offer.connection_id, kb_sold(offer)
+            )
+        alert = text_accept_alert(offer)
+        if len(alert) > 200:
+            alert = alert[:197] + "..."
+        await cb.answer(alert, show_alert=True)
 
-async def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
-    bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"), timeout=15)
+
+@router.callback_query(F.data.startswith("sent:"))
+async def confirm_sent(cb: CallbackQuery, bot: Bot) -> None:
+    try:
+        _, offer_id = cb.data.split(":", 1)
+    except Exception:
+        await cb.answer("❌ Ошибка", show_alert=True)
+        return
+    offer = offers.get(offer_id)
+    if not offer:
+        await cb.answer("✅ Уже подтверждено", show_alert=True)
+        return
+    offer.status = "completed"
+    log_offer(offer)
+    await cb.answer("✅ Спасибо! Подарок отправлен", show_alert=True)
+    if ADMIN_ID:
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"✅ <b>Продажа завершена</b>\n\n"
+                f"Оффер: <code>{offer_id}</code>\n"
+                f"Цена: {offer.price} {offer.currency}\n"
+                f"Покупатель: {html.escape(offer.buyer_name)}"
+            )
+        except Exception:
+            pass
+    offers.pop(offer_id, None)
+
+
+bot_global: Optional[Bot] = None
+
+
+async def cleanup_offers() -> None:
+    while True:
+        try:
+            await asyncio.sleep(60)
+            now = time.time()
+            expired = [
+                oid for oid, o in offers.items()
+                if now - o.created_at > TTL_HOURS * 3600
+            ]
+            for oid in expired:
+                offer = offers.pop(oid, None)
+                if offer and bot_global:
+                    offer.status = "expired"
+                    log_offer(offer)
+                    await safe_edit(
+                        bot_global, "⏰ Оффер истёк",
+                        offer.connection_id, offer.message_id, None, offer.chat_id
+                    )
+            if expired:
+                log.info(f"expired: {len(expired)}")
+        except Exception as e:
+            log.error(f"cleanup: {e}")async def main() -> None:
+    global bot_global
+    log.info("Запуск Gift Offer Bot")
+    session = AiohttpSession(timeout=30)
+    bot_global = Bot(
+        TOKEN,
+        default=DefaultBotProperties(parse_mode="HTML"),
+        session=session
+    )
     dp = Dispatcher()
     dp.include_router(router)
-    try: await dp.start_polling(bot)
-    finally: await bot.session.close()
+    asyncio.create_task(cleanup_offers())
+    try:
+        me = await bot_global.get_me()
+        log.info(f"bot: @{me.username} ({me.id})")
+        log.info(f"admin: {ADMIN_ID}")
+        log.info(f"access: {len(load_allowed())}")
+        log.info(f"ttl: {TTL_HOURS}h")
+        await dp.start_polling(
+            bot_global,
+            allowed_updates=["message", "callback_query", "business_message", "business_connection"]
+        )
+    finally:
+        await bot_global.session.close()
+        log.info("bot stopped")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+
+if name == "main":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("interrupted")
+    except Exception as e:
+        log.exception(f"fatal: {e}")
