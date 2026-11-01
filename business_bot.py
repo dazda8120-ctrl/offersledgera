@@ -61,6 +61,7 @@ LANG_TOKENS = {
     "arb": "ar", "ar": "ar", "араб": "ar",
 }
 
+
 def detect_lang(payload: str) -> str:
     for word in payload.lower().split():
         w = word.strip(".,!?")
@@ -68,8 +69,10 @@ def detect_lang(payload: str) -> str:
             return LANG_TOKENS[w]
     return "ru"
 
+
 _rate_lock = asyncio.Lock()
 _last_request: dict[int, float] = {}
+
 
 async def rate_limit(user_id: int) -> bool:
     async with _rate_lock:
@@ -80,7 +83,9 @@ async def rate_limit(user_id: int) -> bool:
         _last_request[user_id] = now
         return True
 
+
 _allowed_cache: Optional[set[int]] = None
+
 
 def load_allowed() -> set[int]:
     global _allowed_cache
@@ -92,6 +97,7 @@ def load_allowed() -> set[int]:
             _allowed_cache = set()
     return _allowed_cache
 
+
 def save_allowed() -> None:
     if _allowed_cache is None:
         return
@@ -101,12 +107,15 @@ def save_allowed() -> None:
     except Exception as e:
         log.error(f"save users: {e}")
 
+
 def is_allowed(user_id: int) -> bool:
     return user_id == ADMIN_ID or user_id in load_allowed()
+
 
 def grant_access(user_id: int) -> None:
     load_allowed().add(user_id)
     save_allowed()
+
 
 def revoke_access(user_id: int) -> None:
     load_allowed().discard(user_id)
@@ -252,7 +261,10 @@ def parse_price(payload: str) -> Optional[str]:
                 return f"{val:g}"
         except ValueError:
             continue
-    return Nonedef detect_currency(payload: str) -> str:
+    return None
+
+
+def detect_currency(payload: str) -> str:
     p = payload.lower()
     for word in ("gram", "грам", "тон", "тн", "ton", "toncoin"):
         if word in p:
@@ -459,7 +471,8 @@ async def admin_decision(cb: CallbackQuery, bot: Bot) -> None:
         except Exception:
             pass
         try:
-            await cb.message.edit_text(cb.message.html_text + "\n\n— ✅ <b>Добавлен</b>")except Exception:
+            await cb.message.edit_text(cb.message.html_text + "\n\n— ✅ <b>Добавлен</b>")
+        except Exception:
             pass
         await cb.answer("✅ Добавлен")
     else:
@@ -571,7 +584,7 @@ async def create_offer(message: Message, bot: Bot) -> None:
             id=offer_id,
             connection_id=message.business_connection_id,
             chat_id=message.chat.id,
-                        message_id=message.message_id,
+            message_id=message.message_id,
             buyer_id=buyer_id,
             buyer_name=buyer_name,
             buyer_username=buyer_username,
@@ -695,7 +708,10 @@ async def cleanup_offers() -> None:
             if expired:
                 log.info(f"expired: {len(expired)}")
         except Exception as e:
-            log.error(f"cleanup: {e}")async def main() -> None:
+            log.error(f"cleanup: {e}")
+
+
+async def main() -> None:
     global bot_global
     log.info("Запуск Gift Offer Bot")
     session = AiohttpSession(timeout=30)
@@ -722,7 +738,7 @@ async def cleanup_offers() -> None:
         log.info("bot stopped")
 
 
-if name == "main":
+if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
