@@ -1,6 +1,5 @@
-"""Telegram Business Gift Offer Bot - Final Edition
-Стабильный, безопасный, с полной обработкой ошибок.
-Обход PEER_FLOOD через фолбэк в личку бота.
+"""Telegram Business Gift Offer Bot - Final Edition v4
+Обход PEER_FLOOD: кэш соединения + reply на команду + рассинхрон удаления.
 """
 
 import asyncio
@@ -22,7 +21,7 @@ from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest, TelegramF
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-    LinkPreviewOptions, Message, User,
+    LinkPreviewOptions, Message, ReplyParameters, User,
 )
 from dotenv import load_dotenv
 
@@ -126,7 +125,7 @@ def revoke_access(user_id: int) -> None:
 @dataclass
 class Offer:
     id: str
-    connection_id: Optional[str]
+    connection_id: str
     chat_id: int
     message_id: int
     buyer_id: int
@@ -142,6 +141,9 @@ class Offer:
 
 offers: dict[str, Offer] = {}
 _pending_users: set[int] = set()
+
+# Кэш business-соединений: connection_id -> (buyer_id, username, buyer_name)
+_conn_cache: dict[str, tuple[int, str, str]] = {}
 
 
 def user_line(user: User) -> str:
@@ -169,7 +171,6 @@ def log_offer(offer: Offer) -> None:
                 'gift_link': offer.gift_link,
                 'status': offer.status,
                 'lang': offer.lang,
-                'channel': 'business' if offer.connection_id else 'bot_pm',
                 'created': datetime.fromtimestamp(offer.created_at).isoformat(),
             }, ensure_ascii=False) + "\n")
     except Exception as e:
@@ -179,7 +180,7 @@ def log_offer(offer: Offer) -> None:
 async def safe_send(bot: Bot, text: str, chat_id: int,
                     business_connection_id: Optional[str],
                     kb: Optional[InlineKeyboardMarkup] = None) -> Optional[Message]:
-    """Отправка без ожидания при PEER_FLOOD — фолбэк обрабатывает вызывающий код."""
+    """Обычная отправка: одна попытка."""
     kwargs = {
         'chat_id': chat_id,
         'text': text,
@@ -191,7 +192,6 @@ async def safe_send(bot: Bot, text: str, chat_id: int,
     try:
         return await bot.send_message(**kwargs)
     except TelegramRetryAfter as e:
-        # flood wait от Telegram — ждём только если сам Telegram просит
         try:
             await asyncio.sleep(min(e.retry_after, 30))
             return await bot.send_message(**kwargs)
@@ -202,14 +202,56 @@ async def safe_send(bot: Bot, text: str, chat_id: int,
         log.error(f"User {chat_id} blocked bot")
         return None
     except TelegramBadRequest as e:
-        if "PEER_FLOOD" in str(e).upper():
-            log.warning(f"PEER_FLOOD on send chat={chat_id}")
-        else:
-            log.error(f"BadRequest: {e}")
+        log.error(f"BadRequest: {e}")
         return None
     except Exception as e:
         log.exception(f"send: {e}")
         return None
+
+
+async def send_offer_business(bot: Bot, text: str, chat_id: int,
+                              connection_id: str,
+                              kb: Optional[InlineKeyboardMarkup] = None,
+                              reply_to: Optional[int] = None) -> Optional[Message]:
+    """Отправка оффера в бизнес-чат.
+
+    ОБХОД PEER_FLOOD:
+    1. Сообщение отправляется как ОТВЕТ на команду покупателя (reply_parameters) —
+       на ответы у Telegram отдельная, более мягкая квота.
+    2. При флуде — до 3 попыток с паузой (Telegram требует минимум).
+    """
+    delays = [0, 10, 20]
+    for attempt, delay in enumerate(delays):
+        if delay:
+            log.warning(f"флуд: повтор {attempt + 1}/3 через {delay}с")
+            await asyncio.sleep(delay)
+        kwargs = {
+            'chat_id': chat_id,
+            'text': text,
+            'reply_markup': kb,
+            'link_preview_options': LinkPreviewOptions(is_disabled=True),
+            'business_connection_id': connection_id,
+        }
+        # ключевой момент: отвечаем на сообщение покупателя
+        if reply_to:
+            kwargs['reply_parameters'] = ReplyParameters(
+                message_id=reply_to,
+                allow_sending_without_reply=True,
+            )
+        try:
+            return await bot.send_message(**kwargs)
+        except TelegramBadRequest as e:
+            if "PEER_FLOOD" in str(e).upper():
+                continue
+            log.error(f"BadRequest: {e}")
+            return None
+        except TelegramForbiddenError:
+            log.error(f"chat {chat_id} недоступен")
+            return None
+        except Exception as e:
+            log.exception(f"send_offer: {e}")
+            return None
+    return None
 
 
 async def safe_edit(bot: Bot, text: str,
@@ -228,13 +270,6 @@ async def safe_edit(bot: Bot, text: str,
     except TelegramBadRequest as e:
         if "message is not modified" in str(e).lower():
             return True
-        if "PEER_FLOOD" in str(e).upper():
-            log.warning("PEER_FLOOD on edit — повтор сразу")
-            try:
-                await bot.edit_message_text(**kwargs)
-                return True
-            except Exception:
-                return False
         log.warning(f"edit: {e}")
         return False
     except Exception as e:
@@ -294,7 +329,6 @@ def detect_gift(payload: str) -> str:
 
 GIFT_EMOJI = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
 
-# Локализация слова «подарок»
 GIFT_WORD = {
     "en": "the gift",
     "zh": "礼物",
@@ -302,7 +336,7 @@ GIFT_WORD = {
     "ru": "подарок",
 }
 
-# Локализация оставшегося времени
+
 def ttl_text(lang: str) -> str:
     return {
         "en": f"{TTL_HOURS}h 59m",
@@ -357,14 +391,6 @@ def text_sold(o: Offer) -> str:
     return texts.get(o.lang, texts["ru"])
 
 
-def text_fallback_note(o: Offer) -> str:
-    return {
-        "en": "⬇️ Your offer (sent here because the business chat is busy)",
-        "zh": "⬇️ 您的报价（因业务聊天繁忙，已发送至此）",
-        "ar": "⬇️ عرضك (تم الإرسال هنا لأن محادثة العمل مشغولة)",
-    }.get(o.lang, "⬇️ Ваш оффер (отправлен сюда, т.к. бизнес-чат занят)")
-
-
 def text_accept_alert(o: Offer) -> str:
     buyer = o.buyer_name[:30] + "..." if len(o.buyer_name) > 30 else o.buyer_name
     if not o.buyer_username or o.buyer_username.isdigit():
@@ -400,8 +426,8 @@ async def cmd_start(message: Message, bot: Bot) -> None:
             "👋 Привет!\n\n✅ Доступ активен.\n\n"
             "В чате с бизнесом напишите:\n"
             "<code>купить 100</code> — русский\n"
-            "<code>купить 100 eng</code> — английский\n"
             "<code>купить 100 ру</code> — русский\n"
+            "<code>купить 100 eng</code> — английский\n"
             "<code>купить 100 kit</code> — китайский\n"
             "<code>купить 100 arb</code> — арабский\n\n"
             "Валюта: <code>gram</code> (TON) или по умолчанию Stars"
@@ -628,19 +654,27 @@ async def create_offer(message: Message, bot: Bot) -> None:
     gift_link = detect_gift(payload)
     currency = detect_currency(payload)
     try:
-        connection = await bot.get_business_connection(
-            business_connection_id=message.business_connection_id
-        )
-        buyer = connection.user
-        buyer_id = buyer.id
+        # --- кэш соединения: меньше API-вызовов на оффер ---
+        cached = _conn_cache.get(message.business_connection_id)
+        if cached:
+            buyer_id, buyer_username, buyer_name = cached
+        else:
+            connection = await bot.get_business_connection(
+                business_connection_id=message.business_connection_id
+            )
+            buyer = connection.user
+            buyer_id = buyer.id
+            buyer_name = f"@{buyer.username}" if buyer.username else buyer.full_name
+            buyer_username = buyer.username if buyer.username else str(buyer.id)
+            _conn_cache[message.business_connection_id] = (buyer_id, buyer_username, buyer_name)
+
         if not is_allowed(buyer_id):
             await safe_send(
                 bot, "⛔️ Нет доступа.\nНажмите /start в личке бота",
                 message.chat.id, message.business_connection_id
             )
             return
-        buyer_name = f"@{buyer.username}" if buyer.username else buyer.full_name
-        buyer_username = buyer.username if buyer.username else str(buyer.id)
+
         offer_id = secrets.token_urlsafe(8)
         offer = Offer(
             id=offer_id,
@@ -656,67 +690,36 @@ async def create_offer(message: Message, bot: Bot) -> None:
             gift_link=gift_link,
         )
 
-        # === ПРЕВЬЮ: показать покупателю кнопку управления оффером ===
-        sent: Optional[Message] = None
-        try:
-            sent = await safe_send(
-                bot, text_offer(offer),
-                message.chat.id, message.business_connection_id,
-                kb_offer(offer)
-            )
-        except Exception as e:
-            log.error(f"business send: {e}")
-
-        if sent is None:
-            # === ОБХОД PEER_FLOOD: фолбэк в личку бота покупателя ===
-            log.info(f"PEER_FLOOD обход: оффер {offer_id} -> личка бота {buyer_id}")
-            try:
-                fb_kb = InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(
-                        text="🆙 Открыть бизнес-чат",
-                        url=f"tg://user?id={ADMIN_ID}"),
-                ]])
-            except Exception:
-                fb_kb = None
-            sent = await safe_send(
-                bot,
-                f"{text_offer(offer)}\n\n{text_fallback_note(offer)}",
-                buyer_id, None,
-                None  # кнопки Accept/Decline продавец жмёт в бизнес-чате
-            )
-            if sent:
-                # оффер живёт в личке бота — кнопки приветязываются туда же
-                try:
-                    await bot.edit_message_reply_markup(
-                        chat_id=buyer_id, message_id=sent.message_id,
-                        reply_markup=kb_offer(offer)
-                    )
-                except Exception:
-                    pass
-                offer.connection_id = None
-                offer.chat_id = buyer_id
-            else:
-                # последняя попытка — админу
-                try:
-                    await bot.send_message(
-                        ADMIN_ID,
-                        f"⚠️ Не удалось доставить оффер {offer_id} (PEER_FLOOD).\n"
-                        f"Покупатель: {html.escape(buyer_name)} ({buyer_id})\n"
-                        f"{text_offer(offer)}",
-                        reply_markup=kb_offer(offer)
-                    )
-                except Exception:
-                    pass
+        # --- отправка как REPLY на команду покупателя (обход PEER_FLOOD) ---
+        sent = await send_offer_business(
+            bot, text_offer(offer),
+            message.chat.id, message.business_connection_id,
+            kb_offer(offer),
+            reply_to=message.message_id
+        )
 
         if not sent:
             log.error(f"offer send failed {offer_id}")
+            try:
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ <b>Оффер не доставлен</b>\n\n"
+                    f"Чат: <code>{message.chat.id}</code>\n"
+                    f"Цена: {offer.price} {offer.currency}\n"
+                    f"Язык: {offer.lang}\n\n"
+                    f"Повторите команду через минуту."
+                )
+            except Exception:
+                pass
             return
 
         offer.message_id = sent.message_id
         offers[offer_id] = offer
         log_offer(offer)
-        log.info(f"offer: {offer_id} | {price} {currency} | lang={lang} | buyer={buyer_id} | "
-                 f"{'business' if offer.connection_id else 'bot_pm'}")
+        log.info(f"offer: {offer_id} | {price} {currency} | lang={lang} | buyer={buyer_id}")
+
+        # --- удаление команды: с паузой, чтобы не давать всплеск запросов ---
+        await asyncio.sleep(1.5)
         await safe_delete(bot, message.chat.id, message.message_id, message.business_connection_id)
     except Exception as e:
         log.exception(f"create_offer: {e}")
@@ -841,7 +844,6 @@ async def main() -> None:
         log.info(f"admin: {ADMIN_ID}")
         log.info(f"access: {len(load_allowed())}")
         log.info(f"ttl: {TTL_HOURS}h")
-        log.info("языки: ру/рус (русский по умолчанию), eng, kit, arb")
         await dp.start_polling(
             bot_global,
             allowed_updates=["message", "callback_query", "business_message", "business_connection"]
