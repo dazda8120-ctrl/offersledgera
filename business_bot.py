@@ -287,10 +287,10 @@ def text_offer(o: Offer) -> str:
     gift = o.gift_link if o.gift_link != "подарок" else "подарок"
     ttl = f"{TTL_HOURS} ч 59 мин"
     texts = {
-        "en": f"User <b>{name}</b> wants to buy {gift}\nfor <b>{o.price} {o.currency}</b>\n\n<b>⏳ Offer expires in {ttl}</b>",
-        "zh": f"用户 <b>{name}</b> 想以\n<b>{o.price} {o.currency}</b> 购买{gift}\n\n<b>⏳ 报价将在 {ttl} 后过期</b>",
-        "ar": f"المستخدم <b>{name}</b> يرغب في شراء {gift}\nمقابل <b>{o.price} {o.currency}</b>\n\n<b>⏳ ينتهي العرض خلال {ttl}</b>",
-        "ru": f"Пользователь <b>{name}</b> хочет купить\n{gift} за <b>{o.price} {o.currency}</b>\n\n<b>⏳ Предложение истечёт через {ttl}</b>",
+        "en": f"User <b>{name}</b> wants to buy {gift}\nfor <b>{o.price} {o.currency}</b>\n\n<b>Offer expires in {ttl}</b>",
+        "zh": f"用户 <b>{name}</b> 想以\n<b>{o.price} {o.currency}</b> 购买{gift}\n\n<b>报价将在 {ttl} 后过期</b>",
+        "ar": f"المستخدم <b>{name}</b> يرغب في شراء {gift}\nمقابل <b>{o.price} {o.currency}</b>\n\n<b>ينتهي العرض خلال {ttl}</b>",
+        "ru": f"Пользователь <b>{name}</b> хочет купить\n{gift} за <b>{o.price} {o.currency}</b>\n\n<b>Предложение истечёт через {ttl}</b>",
     }
     return texts.get(o.lang, texts["ru"])
 
