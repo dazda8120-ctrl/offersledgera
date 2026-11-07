@@ -61,6 +61,8 @@ LANG_TOKENS = {
     "arb": "ar", "ar": "ar", "араб": "ar",
 }
 
+STAR_EMOJI = "⭐"
+
 
 def detect_lang(payload: str) -> str:
     for word in payload.lower().split():
@@ -268,8 +270,8 @@ def detect_currency(payload: str) -> str:
     p = payload.lower()
     for word in ("gram", "грам", "тон", "тн", "ton", "toncoin"):
         if word in p:
-            return "TON"
-    return "Stars"
+            return "💎 TON"
+    return STAR_EMOJI
 
 
 def detect_gift(payload: str) -> str:
@@ -283,12 +285,12 @@ GIFT_EMOJI = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
 def text_offer(o: Offer) -> str:
     name = html.escape(o.buyer_name)
     gift = o.gift_link if o.gift_link != "подарок" else "подарок"
-    ttl = f"{TTL_HOURS}ч 59м"
+    ttl = f"{TTL_HOURS} ч 59 мин"
     texts = {
-        "en": f"User <b>{name}</b> offers you\n<b>{o.price} {o.currency}</b> for {gift}\n\n<b>Valid for another {ttl}.</b>",
-        "zh": f"用户 <b>{name}</b> 向您出价\n<b>{o.price} {o.currency}</b> 购买{gift}\n\n<b>报价有效期还剩 {ttl}。</b>",
-        "ar": f"المستخدم <b>{name}</b> يعرض عليك\n<b>{o.price} {o.currency}</b> مقابل {gift}\n\n<b>العرض صالح لمدة {ttl} أخرى.</b>",
-        "ru": f"Пользователь <b>{name}</b> предлагает\nВам <b>{o.price} {o.currency}</b> за {gift}\n\nПредложение действует ещё <b>{ttl}.</b>",
+        "en": f"User <b>{name}</b> wants to buy {gift}\nfor <b>{o.price} {o.currency}</b>\n\n<b>⏳ Offer expires in {ttl}</b>",
+        "zh": f"用户 <b>{name}</b> 想以\n<b>{o.price} {o.currency}</b> 购买{gift}\n\n<b>⏳ 报价将在 {ttl} 后过期</b>",
+        "ar": f"المستخدم <b>{name}</b> يرغب في شراء {gift}\nمقابل <b>{o.price} {o.currency}</b>\n\n<b>⏳ ينتهي العرض خلال {ttl}</b>",
+        "ru": f"Пользователь <b>{name}</b> хочет купить\n{gift} за <b>{o.price} {o.currency}</b>\n\n<b>⏳ Предложение истечёт через {ttl}</b>",
     }
     return texts.get(o.lang, texts["ru"])
 
@@ -299,10 +301,10 @@ def text_declined(o: Offer) -> str:
 
 def text_sold(o: Offer) -> str:
     texts = {
-        "en": f"{GIFT_EMOJI} The gift has been sold!\n\n• Click «Transfer» and send the gift to credit {o.currency}.",
-        "zh": f"{GIFT_EMOJI} 礼物已成功售出！\n\n• 点击「转赠」并发送礼物以入账 {o.currency}。",
-        "ar": f"{GIFT_EMOJI} تم بيع الهدية بنجاح!\n\n• اضغط «إرسال» وأرسل الهدية لإضافة {o.currency}.",
-        "ru": f"{GIFT_EMOJI} Подарок успешно продан!\n\n• Нажмите «Передать» и отправьте подарок для зачисления {o.currency}.",
+        "en": f"{GIFT_EMOJI} Deal confirmed!\n\n• Tap «Transfer» to send the gift and receive {o.currency}.",
+        "zh": f"{GIFT_EMOJI} 交易确认！\n\n• 点击「转赠」发送礼物即可到账 {o.currency}。",
+        "ar": f"{GIFT_EMOJI} تم تأكيد الصفقة!\n\n• اضغط «إرسال» لإرسال الهدية واستلام {o.currency}.",
+        "ru": f"{GIFT_EMOJI} Сделка подтверждена!\n\n• Нажмите «Передать» и отправьте подарок — {o.currency} придут автоматически.",
     }
     return texts.get(o.lang, texts["ru"])
 
@@ -342,7 +344,7 @@ async def cmd_start(message: Message, bot: Bot) -> None:
             "👋 Привет!\n\n✅ Доступ активен.\n\n"
             "В чате с бизнесом напишите:\n<code>купить 100</code>\n"
             "Языки: <code>eng</code>, <code>kit</code>, <code>arb</code>\n"
-            "Валюта: <code>gram</code> (TON) или по умолчанию Stars"
+            "Валюта: <code>gram</code> (TON) или по умолчанию ⭐"
         )
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -702,7 +704,7 @@ async def cleanup_offers() -> None:
                     offer.status = "expired"
                     log_offer(offer)
                     await safe_edit(
-                        bot_global, "⏰ Оффер истёк",
+                        bot_global, "⏳ Время предложения истекло",
                         offer.connection_id, offer.message_id, None, offer.chat_id
                     )
             if expired:
