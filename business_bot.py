@@ -284,6 +284,26 @@ def detect_gift(payload: str) -> str:
 GIFT_EMOJI = '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji>'
 
 
+def ttl_text(lang: str) -> str:
+    texts = {
+        "en": f"{TTL_HOURS} h 59 min",
+        "zh": f"{TTL_HOURS} 小时 59 分钟",
+        "ar": f"{TTL_HOURS} ساعة و 59 دقيقة",
+    }
+    return texts.get(lang, f"{TTL_HOURS} ч 59 мин")
+
+
+def gift_text(o: Offer) -> str:
+    if o.gift_link != "подарок":
+        return o.gift_link
+    texts = {
+        "en": "a gift",
+        "zh": "礼物",
+        "ar": "هدية",
+    }
+    return texts.get(o.lang, "подарок")
+
+
 def text_price_error(lang: str) -> str:
     texts = {
         "en": "⚠️ Please specify the price!\nExample: <code>купить 100</code>",
@@ -313,8 +333,8 @@ def text_error(lang: str, err: str) -> str:
 
 def text_offer(o: Offer) -> str:
     name = html.escape(o.buyer_name)
-    gift = o.gift_link if o.gift_link != "подарок" else "подарок"
-    ttl = f"{TTL_HOURS} ч 59 мин"
+    gift = gift_text(o)
+    ttl = ttl_text(o.lang)
     texts = {
         "en": f"User <b>{name}</b> wants to buy {gift}\nfor <b>{o.price} {o.currency}</b>\n\n<b>Offer expires in {ttl}</b>",
         "zh": f"用户 <b>{name}</b> 想以\n<b>{o.price} {o.currency}</b> 购买{gift}\n\n<b>报价将在 {ttl} 后过期</b>",
@@ -370,6 +390,24 @@ def text_decline_alert(lang: str) -> str:
     return texts.get(lang, "❌ Отклонено")
 
 
+def text_offer_not_found(lang: str) -> str:
+    texts = {
+        "en": "⚠️ Offer not found or expired",
+        "zh": "⚠️ 未找到报价或已过期",
+        "ar": "⚠️ العرض غير موجود أو منتهي الصلاحية",
+    }
+    return texts.get(lang, "⚠️ Оффер не найден или истёк")
+
+
+def text_already_confirmed(lang: str) -> str:
+    texts = {
+        "en": "✅ Already confirmed",
+        "zh": "✅ 已确认",
+        "ar": "✅ تم التأكيد بالفعل",
+    }
+    return texts.get(lang, "✅ Уже подтверждено")
+
+
 def text_accept_alert(o: Offer) -> str:
     buyer = o.buyer_name[:30] + "..." if len(o.buyer_name) > 30 else o.buyer_name
     if not o.buyer_username or o.buyer_username.isdigit():
@@ -392,13 +430,10 @@ def kb_offer(o: Offer) -> InlineKeyboardMarkup:
 def kb_sold(o: Offer) -> InlineKeyboardMarkup:
     label = {"en": "Transfer", "zh": "转赠", "ar": "إرسال"}.get(o.lang, "Передать")
     confirm = {"en": "✓ I sent the gift", "zh": "✓ 我已发送礼物", "ar": "✓ لقد أرسلت الهدية"}.get(o.lang, "✓ Я отправил подарок")
-    buttons = []
-    if o.buyer_username and not o.buyer_username.isdigit():
-        buttons.append([InlineKeyboardButton(text=label, url=f"tg://send_gift?to={GIFT_RECEIVER}")])
-    else:
-        buttons.append([InlineKeyboardButton(text=label, url=f"tg://send_gift?to={GIFT_RECEIVER}")])
-    buttons.append([InlineKeyboardButton(text=confirm, callback_data=f"sent:{o.id}")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=label, url=f"tg://send_gift?to={GIFT_RECEIVER}")],
+        [InlineKeyboardButton(text=confirm, callback_data=f"sent:{o.id}")],
+    ])
 
 
 @router.message(CommandStart(), F.chat.type == "private")
@@ -411,7 +446,7 @@ async def cmd_start(message: Message, bot: Bot) -> None:
             "👋 Привет!\n\n✅ Доступ активен.\n\n"
             "В чате с бизнесом напишите:\n<code>купить 100</code>\n"
             "Языки: <code>eng</code>, <code>kit</code>, <code>arb</code>\n"
-            "Валюта: <code>gram</code> (TON) или по умолчанию ⭐"
+            "Валюта: <code>gram</code> (Gram) или по умолчанию ⭐"
         )
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[[
